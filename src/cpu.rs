@@ -1,4 +1,5 @@
 use crate::bus::Bus;
+pub const CPU_START_ADDR: u64 = 0x80000000;
 pub struct Cpu {
     regs: [u64; 32],      // 32 个通用寄存器 x0-x31
     pc: u64,              // 程序计数器 (Program Counter)
@@ -8,17 +9,21 @@ pub struct Cpu {
 }
 
 impl Cpu {
-    pub fn new(dram_size: usize, start_addr: u64) -> Self {
+    pub fn new() -> Self {
         Cpu {
             regs: [0; 32],
-            pc: start_addr,
-            bus: Bus::new(dram_size),
+            pc: CPU_START_ADDR,
+            bus: Bus::new(),
         }
     }
-}
 
-pub fn load_program_from_file(bus: &mut Bus, program: &[u8], start_addr: u64) {
-    for (i, &byte) in program.iter().enumerate() {
-        bus.write_u8(start_addr + i as u64, byte);
+    pub fn init_dram(&mut self) {
+        let result = self.bus.dram.load_binary_file("test.bin", CPU_START_ADDR);
+        if let Err(_) = result {
+            panic!("Failed to load binary file into DRAM");
+        }
+    }
+    fn fetch(&self) -> Result<u32, ()> {
+        self.bus.read_u32(self.pc)
     }
 }

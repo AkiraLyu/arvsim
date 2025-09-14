@@ -7,9 +7,9 @@ pub struct Dram {
 }
 
 impl Dram {
-    pub fn new(size: usize) -> Self {
+    pub fn new() -> Self {
         Dram {
-            memory: vec![0; size],
+            memory: vec![0; DRAM_SIZE],
         }
     }
 
@@ -87,7 +87,7 @@ mod tests {
 
     #[test]
     fn test_dram_read_write() {
-        let mut dram = Dram::new(DRAM_SIZE);
+        let mut dram = Dram::new();
         dram.write_u8(DRAM_BASE, 42).unwrap();
         let value = dram.read_u8(DRAM_BASE).unwrap();
         assert_eq!(value, 42);
@@ -95,14 +95,14 @@ mod tests {
 
     #[test]
     fn test_dram_read_write_out_of_bounds() {
-        let mut dram = Dram::new(DRAM_SIZE);
+        let mut dram = Dram::new();
         let result = dram.read_u8(DRAM_BASE + DRAM_SIZE as u64);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_dram_load_binary_file() {
-        let mut dram = Dram::new(DRAM_SIZE);
+        let mut dram = Dram::new();
         let result = dram.load_binary_file("/home/akira/test.bin", DRAM_BASE);
         assert!(result.is_ok());
         assert_eq!(dram.read_u8(DRAM_BASE).unwrap(), 0x7F);
