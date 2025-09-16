@@ -3,6 +3,17 @@ pub struct Bus {
    pub dram: Dram,
 }
 
+#[derive(Debug)]
+pub enum BusError {
+    Fault,
+}
+
+pub trait MemDevice {
+    fn read_32(&mut self, addr: u64) -> Result<u32, BusError>;
+    fn write_32(&mut self, addr: u64, value: u32) -> Result<(), BusError>;
+}
+
+
 impl Bus {
     pub fn new() -> Self {
         Bus {
