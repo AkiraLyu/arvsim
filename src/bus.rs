@@ -61,3 +61,37 @@ impl MemDevice for Bus {
         Err(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dram::Dram;
+
+    #[test]
+    fn test_bus_read_write() {
+        let mut dram = Dram::new();
+        let base = dram.base;
+        let size = 16;
+        for i in 0..size {
+            dram.dram[i] = i as u8;
+        }
+
+        let mut bus = Bus::new();
+        bus.attach_ram(base, Box::new(dram));
+
+        // read
+        for i in 0..size {
+            let val = bus.read(base + i as u64, 1).unwrap();
+            assert_eq!(val, i as u64);
+        }
+
+        // write
+        for i in 0..size {
+            bus.write(base + i as u64, (i + 1) as u32, 1).unwrap();
+        }
+        for i in 0..size {
+            let val = bus.read(base + i as u64, 1).unwrap();
+            assert_eq!(val, (i + 1) as u64);
+        }
+    }
+} 

@@ -25,6 +25,9 @@ impl Cpu {
             match self.fetch() {
                 Ok(instruction) => {
                     println!("pc: {:#x}, instruction: {:#x}", self.pc, instruction);
+                    print!("test uart output: ");
+                    let _res = self.bus.write(crate::cfg::UART_BASE, 'A' as u32, 1);
+                    print!("\n");
                 }
                 Err(_) => {
                     eprintln!("Failed to fetch instruction at pc: {:#x}", self.pc);
