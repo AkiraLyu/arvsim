@@ -1,70 +1,63 @@
-use crate::dram::Dram;
-pub struct Bus {
-   pub dram: Dram,
-}
-
-#[derive(Debug)]
-pub enum BusError {
-    Fault,
-}
+use std::collections::BTreeMap;
 
 pub trait MemDevice {
-    fn read_32(&mut self, addr: u64) -> Result<u32, BusError>;
-    fn write_32(&mut self, addr: u64, value: u32) -> Result<(), BusError>;
+    fn read(&mut self, addr: u64, size: usize) -> Result<u64, ()>;
+    fn write(&mut self, addr: u64, value: u32, size: usize) -> Result<(), ()>;
 }
 
+pub struct Bus {
+    ram_map: BTreeMap<u64, Box<dyn MemDevice>>,
+    uart_map: BTreeMap<u64, Box<dyn MemDevice>>,
+}
 
 impl Bus {
     pub fn new() -> Self {
         Bus {
-            dram: Dram::new(),
+            ram_map: BTreeMap::new(),
+            uart_map: BTreeMap::new(),
         }
     }
 
-    pub fn read_u8(&self, addr: u64) -> Result<u8, ()> {
-        if addr > crate::dram::DRAM_SIZE as u64 {
-            return self.dram.read_u8(addr).map_err(|_| ());
-        }
-        Err(())
+    pub fn attach_ram(&mut self, base: u64, dev: Box<dyn MemDevice>) {
+        self.ram_map.insert(base, dev);
     }
 
-    pub fn write_u8(&mut self, addr: u64, value: u8) -> Result<(), ()> {
-        if addr >= crate::dram::DRAM_SIZE as u64 {
-            return self.dram.write_u8(addr, value).map_err(|_| ());
-        }
-        Err(())
+    pub fn attach_uart(&mut self, base: u64, dev: Box<dyn MemDevice>) {
+        self.uart_map.insert(base, dev);
     }
 
-    pub fn read_u32(&self, addr: u64) -> Result<u32, ()> {
-        if addr >= crate::dram::DRAM_SIZE as u64 {
-            return self.dram.read_u32(addr).map_err(|_| ());
+    fn find_dev(
+        map: &mut BTreeMap<u64, Box<dyn MemDevice>>,
+        addr: u64,
+    ) -> Option<&mut Box<dyn MemDevice>> {
+        let mut key = None;
+        for k in map.keys() {
+            if *k <= addr {
+                key = Some(*k);
+            }
         }
-        Err(())
-    }
-
-    pub fn write_u32(&mut self, addr: u64, value: u32) -> Result<(), ()> {
-        if addr >= crate::dram::DRAM_SIZE as u64 {
-            return self.dram.write_u32(addr, value).map_err(|_| ());
-        }
-        Err(())
+        key.and_then(move |k| map.get_mut(&k))
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_bus_read_write() {
-        let mut bus = Bus::new();
-        let _ = bus.write_u8(0x80000000, 42);
-        let value = bus.read_u8(0x80000000);
-        assert_eq!(value, Ok(42));
+impl MemDevice for Bus {
+    fn read(&mut self, addr: u64, size: usize) -> Result<u64, ()> {
+        if let Some(dev) = Self::find_dev(&mut self.ram_map, addr) {
+            return dev.read(addr, size);
+        }
+        if let Some(dev) = Self::find_dev(&mut self.uart_map, addr) {
+            return dev.read(addr, size);
+        }
+        Err(())
     }
 
-    #[test]
-    fn test_bus_read_write_out_of_bounds() {
-        let bus = Bus::new();
-        let _ = bus.read_u8(0x80000000 + crate::dram::DRAM_SIZE as u64);
+    fn write(&mut self, addr: u64, value: u32, size: usize) -> Result<(), ()> {
+        if let Some(dev) = Self::find_dev(&mut self.ram_map, addr) {
+            return dev.write(addr, value, size);
+        }
+        if let Some(dev) = Self::find_dev(&mut self.uart_map, addr) {
+            return dev.write(addr, value, size);
+        }
+        Err(())
     }
 }

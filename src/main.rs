@@ -1,19 +1,22 @@
 use std::env::args;
 
-mod cpu;
 mod bus;
+mod cfg;
+mod cpu;
 mod dram;
-mod csr;
-mod instruction;
 
 fn main() {
-    let mut args = args();
-    if args.len() != 2 {
+    let args = args();
+    if args.len() < 2 {
         eprintln!("Usage: cargo run <binary_file>");
-        return;
     }
-    let mut cpu = cpu::Cpu::new();
+
+    let mut dram = dram::Dram::new();
+    dram.load(&args.into_iter().nth(1).unwrap()).unwrap();
+    let mut bus = bus::Bus::new();
+    bus.attach_ram(dram.base, Box::new(dram));
+
+    let mut cpu = cpu::Cpu::new(Box::new(bus));
     cpu.reset();
-    cpu.init_dram(args.nth(1).unwrap().as_str());
     cpu.run();
 }
