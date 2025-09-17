@@ -1,4 +1,4 @@
-use crate::bus::MemDevice;
+use crate::{bus::MemDevice, exception::Exception};
 
 pub struct Dram {
     pub dram: Vec<u8>,
@@ -31,13 +31,13 @@ impl Dram {
 }
 
 impl MemDevice for Dram {
-    fn read(&mut self, addr: u64, size: usize) -> Result<u64, ()> {
+    fn read(&mut self, addr: u64, size: usize) -> Result<u64, Exception> {
         if addr < self.base {
-            return Err(());
+            return Err(Exception::LoadAccessFault(addr));
         }
         let offset = (addr - self.base) as usize;
         if offset + size > self.dram.len() {
-            return Err(());
+            return Err(Exception::LoadAccessFault(addr));
         }
 
         let mut val = 0u64;
@@ -47,13 +47,13 @@ impl MemDevice for Dram {
         Ok(val)
     }
 
-    fn write(&mut self, addr: u64, value: u32, size: usize) -> Result<(), ()> {
+    fn write(&mut self, addr: u64, value: u32, size: usize) -> Result<(), Exception> {
         if addr < self.base {
-            return Err(());
+            return Err(Exception::StoreAccessFault(addr));
         }
         let offset = (addr - self.base) as usize;
         if offset + size > self.dram.len() {
-            return Err(());
+            return Err(Exception::StoreAccessFault(addr));
         }
 
         for i in 0..size {

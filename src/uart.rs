@@ -1,4 +1,4 @@
-use crate::bus::MemDevice;
+use crate::{bus::MemDevice, exception::Exception};
 
 pub struct Uart {
     pub base: u64,
@@ -11,7 +11,7 @@ impl Uart {
 }
 
 impl MemDevice for Uart {
-    fn read(&mut self, addr: u64, _size: usize) -> Result<u64, ()> {
+    fn read(&mut self, addr: u64, _size: usize) -> Result<u64, Exception> {
         let offset = addr - self.base;
         match offset {
             0x00 => {
@@ -22,11 +22,11 @@ impl MemDevice for Uart {
                 // LSR (Line Status Register)，bit5=1 表示 THR 空
                 Ok(0x20)
             }
-            _ => Err(()),
+            _ => Err(Exception::IllegalInstruction(addr)),
         }
     }
 
-    fn write(&mut self, addr: u64, value: u32, _size: usize) -> Result<(), ()> {
+    fn write(&mut self, addr: u64, value: u32, _size: usize) -> Result<(), Exception> {
         let offset = addr - self.base;
         match offset {
             0x00 => {
@@ -37,7 +37,7 @@ impl MemDevice for Uart {
                 std::io::stdout().flush().unwrap();
                 Ok(())
             }
-            _ => Err(()),
+            _ => Err(Exception::IllegalInstruction(addr)),
         }
     }
 }
@@ -79,6 +79,6 @@ mod tests {
         // 写入字符 'A' (ASCII 65)
         // 我们无法捕获 stdout，但可以验证操作返回 Ok
         let result = uart.write(thr_addr, 65, 8);
-        assert_eq!(result, Ok(()));
+        assert!(result.is_ok());
     }
 }

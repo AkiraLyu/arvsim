@@ -5,6 +5,7 @@ mod cfg;
 mod cpu;
 mod dram;
 mod uart;
+mod exception;
 
 fn main() {
     let args = args();

@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
+use crate::exception::Exception;
 
 pub trait MemDevice {
-    fn read(&mut self, addr: u64, size: usize) -> Result<u64, ()>;
-    fn write(&mut self, addr: u64, value: u32, size: usize) -> Result<(), ()>;
+    fn read(&mut self, addr: u64, size: usize) -> Result<u64, Exception>;
+    fn write(&mut self, addr: u64, value: u32, size: usize) -> Result<(), Exception>;
 }
 
 pub struct Bus {
@@ -41,24 +42,24 @@ impl Bus {
 }
 
 impl MemDevice for Bus {
-    fn read(&mut self, addr: u64, size: usize) -> Result<u64, ()> {
+    fn read(&mut self, addr: u64, size: usize) -> Result<u64, Exception> {
         if let Some(dev) = Self::find_dev(&mut self.ram_map, addr) {
             return dev.read(addr, size);
         }
         if let Some(dev) = Self::find_dev(&mut self.uart_map, addr) {
             return dev.read(addr, size);
         }
-        Err(())
+        Err(Exception::LoadAccessFault(addr))
     }
 
-    fn write(&mut self, addr: u64, value: u32, size: usize) -> Result<(), ()> {
+    fn write(&mut self, addr: u64, value: u32, size: usize) -> Result<(), Exception> {
         if let Some(dev) = Self::find_dev(&mut self.ram_map, addr) {
             return dev.write(addr, value, size);
         }
         if let Some(dev) = Self::find_dev(&mut self.uart_map, addr) {
             return dev.write(addr, value, size);
         }
-        Err(())
+        Err(Exception::StoreAccessFault(addr))
     }
 }
 

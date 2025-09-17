@@ -28,6 +28,7 @@ impl Cpu {
                     print!("test uart output: ");
                     let _res = self.bus.write(crate::cfg::UART_BASE, 'A' as u32, 1);
                     print!("\n");
+                    self.pc = self.execute().unwrap_or(self.pc);
                 }
                 Err(_) => {
                     eprintln!("Failed to fetch instruction at pc: {:#x}", self.pc);
@@ -39,8 +40,13 @@ impl Cpu {
 
     // read a 32 bits instruction from memory and increment the pc
     fn fetch(&mut self) -> Result<u32, ()> {
-        let instruction = self.bus.read(self.pc, 4)?;
-        // self.pc += 4;
+        let instruction = self.bus.read(self.pc, 4).unwrap();
         Ok(instruction as u32)
     }
+
+    // execute the instruction and return the new pc address
+    fn execute(&mut self) -> Result<u64, ()> {
+        Ok((self.pc + 4) as u64)
+    }
+
 }
