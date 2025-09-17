@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
 use crate::exception::Exception;
+use std::collections::BTreeMap;
 
 pub trait MemDevice {
     fn read(&mut self, addr: u64, size: usize) -> Result<u64, Exception>;
@@ -95,4 +95,5 @@ mod tests {
             assert_eq!(val, (i + 1) as u64);
         }
     }
-} 
+}
+

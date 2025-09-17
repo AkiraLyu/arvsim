@@ -110,3 +110,4 @@ mod tests {
         assert_eq!(val, 0x464C457F); // ELF magic number
     }
 }
+

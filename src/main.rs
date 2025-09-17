@@ -4,8 +4,8 @@ mod bus;
 mod cfg;
 mod cpu;
 mod dram;
-mod uart;
 mod exception;
+mod uart;
 
 fn main() {
     let args = args();
@@ -24,3 +24,4 @@ fn main() {
     cpu.reset();
     cpu.run();
 }
+

@@ -9,3 +9,4 @@ pub struct PrivilegeMode {
     pub mtval: u64,   // Machine Trap Value
     pub mtvec: u64,   // Machine Trap-Vector Base Address
 }
+

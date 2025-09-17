@@ -1,4 +1,5 @@
 use crate::bus::MemDevice;
+use crate::exception::Exception;
 
 pub struct Cpu {
     pub registers: [u64; 32],
@@ -26,8 +27,8 @@ impl Cpu {
                 Ok(instruction) => {
                     println!("pc: {:#x}, instruction: {:#x}", self.pc, instruction);
                     print!("test uart output: ");
-                    let _res = self.bus.write(crate::cfg::UART_BASE, 'A' as u32, 1);
-                    print!("\n");
+                    let _result = self.bus.write(crate::cfg::UART_BASE, 'A' as u32, 1);
+                    println!("\n");
                     self.pc = self.execute().unwrap_or(self.pc);
                 }
                 Err(_) => {
@@ -39,14 +40,24 @@ impl Cpu {
     }
 
     // read a 32 bits instruction from memory and increment the pc
-    fn fetch(&mut self) -> Result<u32, ()> {
-        let instruction = self.bus.read(self.pc, 4).unwrap();
-        Ok(instruction as u32)
+    fn fetch(&mut self) -> Result<u32, Exception> {
+        match self.bus.read(self.pc, 4) {
+            Ok(instruction) => Ok(instruction as u32),
+            Err(e) => {
+                match &e {
+                    Exception::IllegalInstruction(addr)
+                    | Exception::LoadAccessFault(addr)
+                    | Exception::StoreAccessFault(addr) => {
+                        eprintln!("Memory access error at address: 0x{:016x}", addr);
+                    }
+                }
+                Err(e)
+            }
+        }
     }
-
     // execute the instruction and return the new pc address
     fn execute(&mut self) -> Result<u64, ()> {
-        Ok((self.pc + 4) as u64)
+        Ok(self.pc + 4)
     }
-
 }
+
