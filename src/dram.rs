@@ -49,11 +49,11 @@ impl MemDevice for Dram {
 
     fn write(&mut self, addr: u64, value: u32, size: usize) -> Result<(), Exception> {
         if addr < self.base {
-            return Err(Exception::StoreAccessFault(addr));
+            return Err(Exception::StoreAMOAccessFault(addr));
         }
         let offset = (addr - self.base) as usize;
         if offset + size > self.dram.len() {
-            return Err(Exception::StoreAccessFault(addr));
+            return Err(Exception::StoreAMOAccessFault(addr));
         }
 
         for i in 0..size {

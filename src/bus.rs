@@ -59,7 +59,7 @@ impl MemDevice for Bus {
         if let Some(dev) = Self::find_dev(&mut self.uart_map, addr) {
             return dev.write(addr, value, size);
         }
-        Err(Exception::StoreAccessFault(addr))
+        Err(Exception::StoreAMOAccessFault(addr))
     }
 }
 

@@ -1,7 +1,17 @@
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub enum Exception {
-    LoadAccessFault(u64),    // 读内存出错（带地址信息）
-    StoreAccessFault(u64),   // 写内存出错（带地址信息）
-    IllegalInstruction(u64), // 非法指令异常（带地址信息）
+    InstructionAddrMisaligned(u64),
+    InstructionAccessFault(u64),
+    IllegalInstruction(u64),
+    Breakpoint(u64),
+    LoadAccessMisaligned(u64),
+    LoadAccessFault(u64),
+    StoreAMOAddrMisaligned(u64),
+    StoreAMOAccessFault(u64),
+    EnvironmentCallFromUMode(u64),
+    EnvironmentCallFromSMode(u64),
+    EnvironmentCallFromMMode(u64),
+    InstructionPageFault(u64),
+    LoadPageFault(u64),
+    StoreAMOPageFault(u64),
 }
-

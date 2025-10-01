@@ -64,21 +64,22 @@ mod tests {
     fn test_read_rbr_is_always_empty() {
         let mut uart = Uart::new(UART_BASE_ADDR);
         // 读取 Receiver Buffer Register (RBR)
-        let rbr_addr = UART_BASE_ADDR + 0x00;
+        let rbr_addr = UART_BASE_ADDR;
         match uart.read(rbr_addr, 8) {
             Ok(value) => assert_eq!(value, 0),
             Err(_) => panic!("Reading RBR should not fail"),
         }
     }
-  
+
     #[test]
     fn test_write_to_thr_succeeds() {
         let mut uart = Uart::new(UART_BASE_ADDR);
         // 写入 Transmitter Holding Register (THR)
-        let thr_addr = UART_BASE_ADDR + 0x00;
+        let thr_addr = UART_BASE_ADDR;
         // 写入字符 'A' (ASCII 65)
         // 我们无法捕获 stdout，但可以验证操作返回 Ok
         let result = uart.write(thr_addr, 65, 8);
         assert!(result.is_ok());
     }
 }
+
