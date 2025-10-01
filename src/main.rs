@@ -7,6 +7,7 @@ mod dram;
 mod exception;
 mod uart;
 mod instruction;
+mod csr;
 
 fn main() {
     let args = args();

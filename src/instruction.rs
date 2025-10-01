@@ -1,3 +1,5 @@
+use crate::csr;
+
 pub struct Instruction {
     pub opcode: u8,
     pub rd: u8,
@@ -19,5 +21,23 @@ pub fn decode(instruction:u32) -> Instruction {
 pub fn execute(cpu: &mut crate::cpu::Cpu, inst: Instruction) -> Result<(), crate::exception::Exception> {
     match inst.opcode {
         _ => {todo!()}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_decode_addi() {
+        let inst: u32 = 0x02a00f93;
+        let decoded = decode(inst);
+
+        assert_eq!(decoded.opcode, 0x13);
+        assert_eq!(decoded.rd, 31);
+        assert_eq!(decoded.funct3, 0);
+        assert_eq!(decoded.rs1, 0);
+        assert_eq!(decoded.rs2, 10);
+        assert_eq!(decoded.funct7, 0x01);
     }
 }

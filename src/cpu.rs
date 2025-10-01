@@ -1,4 +1,5 @@
 use crate::bus::MemDevice;
+use crate::csr;
 use crate::exception::Exception;
 use crate::instruction;
 
@@ -6,6 +7,7 @@ pub struct Cpu {
     pub registers: [u64; 32],
     pub pc: u64,
     pub bus: Box<dyn MemDevice>,
+    pub csr: csr::Csr,
 }
 
 impl Cpu {
@@ -14,6 +16,7 @@ impl Cpu {
             registers: [0; 32],
             pc: crate::cfg::CPU_START_ADDR,
             bus,
+            csr: csr::Csr::new(),
         };
         cpu.registers[2] = crate::cfg::DRAM_END;
         cpu
@@ -67,8 +70,10 @@ impl Cpu {
     fn execute(&mut self, instruction: u64) -> Result<u64, Exception> {
         let inst = instruction as u32;
         let decoded = instruction::decode(inst);
-        instruction::execute(self, decoded)?;
-        Ok(self.pc + 4)
+        // instruction::execute(self, decoded)?;
+        // Ok(self.pc + 4)
+        Ok(self.pc)
+        
     }
 }
 

@@ -107,7 +107,7 @@ mod tests {
         let result = dram.load("/home/akira/test.bin");
         assert!(result.is_ok());
         let val = dram.read(dram.base, 4).unwrap();
-        assert_eq!(val, 0x464C457F); // ELF magic number
+        assert_eq!(val, 0x02a00f93);
     }
 }
 
