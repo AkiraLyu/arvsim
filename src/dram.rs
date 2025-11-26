@@ -1,4 +1,4 @@
-use crate::{bus::MemDevice, exception::Exception};
+use crate::{bus::MemDevice, trap::Exception};
 
 pub struct Dram {
     pub dram: Vec<u8>,

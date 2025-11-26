@@ -103,4 +103,12 @@ impl Csr {
             _ => self.csrs[addr] = value,
         }
     }
+    
+    pub fn dump_csr(&self) {
+        for (i, &value) in self.csrs.iter().enumerate() {
+            if value != 0 {
+                println!("CSR[0x{:03x}] = 0x{:016x}", i, value);
+            }
+        }
+    }
 }

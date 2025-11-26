@@ -1,4 +1,4 @@
-use crate::{bus::MemDevice, exception::Exception};
+use crate::{bus::MemDevice, trap::Exception};
 
 pub struct Uart {
     pub base: u64,
@@ -34,7 +34,7 @@ impl MemDevice for Uart {
                 let ch = (value & 0xff) as u8;
                 print!("{}", ch as char);
                 use std::io::Write;
-                std::io::stdout().flush().unwrap();
+                std::io::stdout().flush().map_err(|_| Exception::StoreAMOAccessFault(addr))?;
                 Ok(())
             }
             _ => Err(Exception::IllegalInstruction(addr)),
@@ -77,7 +77,6 @@ mod tests {
         // 写入 Transmitter Holding Register (THR)
         let thr_addr = UART_BASE_ADDR;
         // 写入字符 'A' (ASCII 65)
-        // 我们无法捕获 stdout，但可以验证操作返回 Ok
         let result = uart.write(thr_addr, 65, 8);
         assert!(result.is_ok());
     }

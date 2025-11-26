@@ -1,4 +1,4 @@
-use crate::exception::Exception;
+use crate::trap::Exception;
 use std::collections::BTreeMap;
 
 pub trait MemDevice {

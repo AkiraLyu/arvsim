@@ -1,4 +1,4 @@
-use crate::csr;
+use crate::{cpu::Cpu, trap::Exception};
 
 pub struct Instruction {
     pub opcode: u8,
@@ -7,20 +7,93 @@ pub struct Instruction {
     pub rs1: u8,
     pub rs2: u8,
     pub funct7: u8,
-}
-pub fn decode(instruction:u32) -> Instruction {
-    let opcode = (instruction & 0x0000007f) as u8;
-    let rd = ((instruction & 0x00000f80) >> 7) as u8;
-    let rs1 = ((instruction & 0x000f8000) >> 15) as u8;
-    let rs2 = ((instruction & 0x01f00000) >> 20) as u8;
-    let funct3 = ((instruction & 0x00007000) >> 12) as u8;
-    let funct7 = ((instruction & 0xfe000000) >> 25) as u8;
-    Instruction { opcode, rd, rs1, rs2, funct3, funct7 }
+    pub raw: u32,
 }
 
-pub fn execute(cpu: &mut crate::cpu::Cpu, inst: Instruction) -> Result<(), crate::exception::Exception> {
+pub fn decode(instruction: u32) -> Instruction {
+    let opcode = (instruction & 0x7f) as u8;
+    let rd = ((instruction >> 7) & 0x1f) as u8;
+    let funct3 = ((instruction >> 12) & 0x07) as u8;
+    let rs1 = ((instruction >> 15) & 0x1f) as u8;
+    let rs2 = ((instruction >> 20) & 0x1f) as u8;
+    let funct7 = ((instruction >> 25) & 0x7f) as u8;
+
+    Instruction {
+        opcode,
+        rd,
+        funct3,
+        rs1,
+        rs2,
+        funct7,
+        raw: instruction,
+    }
+}
+
+pub fn execute(cpu: &mut Cpu, inst: Instruction) -> Result<(), Exception> {
     match inst.opcode {
-        _ => {todo!()}
+        0x33 => { // R-type (ADD, SUB, etc.)
+            match (inst.funct3, inst.funct7) {
+                (0x0, 0x00) => { // ADD
+                    let result = cpu.registers[inst.rs1 as usize].wrapping_add(cpu.registers[inst.rs2 as usize]);
+                    cpu.registers[inst.rd as usize] = result;
+                    Ok(())
+                }
+                (0x0, 0x20) => { // SUB
+                    let result = cpu.registers[inst.rs1 as usize].wrapping_sub(cpu.registers[inst.rs2 as usize]);
+                    cpu.registers[inst.rd as usize] = result;
+                    Ok(())
+                }
+                _ => Err(Exception::IllegalInstruction(inst.opcode as u64)),
+            }
+        }
+        0x13 => { // I-type (ADDI, etc.)
+            match inst.funct3 {
+                0x0 => { // ADDI
+                    let imm = ((inst.raw as i32) >> 20) as u64;
+                    cpu.registers[inst.rd as usize] = cpu.registers[inst.rs1 as usize].wrapping_add(imm);
+                    Ok(())
+                }
+                _ => Err(Exception::IllegalInstruction(inst.opcode as u64)),
+            }
+        }
+        0x03 => { // Load
+            let addr = cpu.registers[inst.rs1 as usize].wrapping_add(inst.rs2 as u64); // I-type 立即数
+            match inst.funct3 {
+                0x0 => { // LB
+                    let val = cpu.bus.read(addr,1)?;
+                    cpu.registers[inst.rd as usize] = val;
+                    Ok(())
+                }
+                0x1 => { // LH
+                    let val = cpu.bus.read(addr,2)?;
+                    cpu.registers[inst.rd as usize] = val;
+                    Ok(())
+                }
+                0x2 => { // LW
+                    let val = cpu.bus.read(addr,4)?;
+                    cpu.registers[inst.rd as usize] = val;
+                    Ok(())
+                }
+                0x3 => { // LD (64-bit)
+                    let val = cpu.bus.read(addr,8)?;
+                    cpu.registers[inst.rd as usize] = val;
+                    Ok(())
+                }
+                _ => Err(Exception::IllegalInstruction(inst.opcode as u64)),
+            }
+        }
+        0x23 => { // Store
+            let addr = cpu.registers[inst.rs1 as usize].wrapping_add(inst.rs2 as u64); // S-type 立即数
+            match inst.funct3 {
+                0x0 => cpu.bus.write(addr, 1, cpu.registers[inst.rd as usize] as usize)?,
+                0x1 => cpu.bus.write(addr, 2, cpu.registers[inst.rd as usize] as usize)?,
+                0x2 => cpu.bus.write(addr, 4, cpu.registers[inst.rd as usize] as usize)?,
+                0x3 => cpu.bus.write(addr, 8, cpu.registers[inst.rd as usize] as usize)?,
+                _ => return Err(Exception::IllegalInstruction(inst.opcode as u64)),
+            };
+            Ok(())
+        }
+        _ => Err(Exception::IllegalInstruction(cpu.pc)),
     }
 }
 
