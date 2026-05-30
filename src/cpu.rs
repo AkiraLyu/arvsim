@@ -30,6 +30,13 @@ impl Cpu {
         self.pc = crate::cfg::CPU_START_ADDR;
     }
 
+    pub fn step(&mut self) -> Result<(), Exception> {
+        let instruction = self.fetch()?;
+        let new_pc = self.execute(instruction)?;
+        self.pc = new_pc;
+        Ok(())
+    }
+
     pub fn run(&mut self) {
         loop {
             if DEBUG {

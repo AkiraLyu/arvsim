@@ -103,11 +103,17 @@ mod tests {
 
     #[test]
     fn test_dram_load() {
+        let path =
+            std::env::temp_dir().join(format!("arvsim-dram-load-{}.bin", std::process::id()));
+        std::fs::write(&path, [0x93, 0x0f, 0xa0, 0x02]).unwrap();
+
         let mut dram = Dram::new();
-        let result = dram.load("/home/akira/test.bin");
+        let result = dram.load(path.to_str().unwrap());
         assert!(result.is_ok());
         let val = dram.read(dram.base, 4).unwrap();
         assert_eq!(val, 0x02a00f93);
+
+        std::fs::remove_file(path).unwrap();
     }
 }
 

@@ -1,13 +1,6 @@
 use std::env::args;
 
-mod bus;
-mod cfg;
-mod cpu;
-mod csr;
-mod dram;
-mod instruction;
-mod trap;
-mod uart;
+use arvsim::{bus, cfg, cpu, dram, uart};
 
 fn main() {
     let mut args = args();
