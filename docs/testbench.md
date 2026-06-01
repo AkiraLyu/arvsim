@@ -43,13 +43,13 @@ scripts/build_xv6_fixture.sh
 scripts/run_testbench.sh --with-xv6-fixture
 ```
 
-主动检查未来契约测试：
+主动检查完整契约测试：
 
 ```sh
 scripts/run_testbench.sh --future-contracts
 ```
 
-`--future-contracts` 中的 ignored 测试在当前模拟器上预期会失败。它们不是当前实现的回归测试，而是用于标记“距离 xv6 启动还缺什么”。
+`--future-contracts` 会运行默认测试、ignored RV64 契约和 ignored xv6 契约。现在这些 xv6 契约已经可以通过，但 full usertests 耗时很长，不建议在日常短反馈中直接运行。
 
 只检查 xv6 完整运行契约：
 
@@ -72,6 +72,16 @@ xv6 契约测试位于 `tests/xv6_fixture.rs`，默认 ignored。它们覆盖以
 
 ```sh
 ARVSIM_XV6_FULL_USERTESTS_STEPS=4000000000 scripts/run_testbench.sh --xv6-contracts
+```
+
+耗时提示：
+
+- `xv6_runs_quick_usertests` 已在 debug test harness 下通过，但需要较长时间。
+- `xv6_runs_full_usertests_suite` 已在 release test harness 下通过；debug full 预计耗时数小时。
+- 日常验证完整 xv6 行为时，推荐先运行：
+
+```sh
+cargo test --release --test xv6_fixture xv6_runs_full_usertests_suite -- --ignored --nocapture
 ```
 
 ## 工具依赖
@@ -98,4 +108,11 @@ ARVSIM_XV6_FULL_USERTESTS_STEPS=4000000000 scripts/run_testbench.sh --xv6-contra
 - `target/testbench/xv6-riscv/kernel/kernel.bin`
 - `target/testbench/xv6-riscv/fs.img`
 
-当前默认不运行 xv6 真启动测试，因为模拟器还没有补齐 xv6 必需的 RV64GC、CSR、特权态、trap/timer、PLIC 和 virtio 行为。
+当前 xv6 契约测试保持 ignored，只是为了避免默认 testbench 过慢。已验证状态：
+
+- `scripts/run_testbench.sh` 通过。
+- `cargo test --test xv6_fixture xv6_runs_quick_usertests -- --ignored --nocapture` 通过。
+- `cargo test --release --test xv6_fixture xv6_runs_full_usertests_suite -- --ignored --nocapture` 通过。
+- `cargo test --release --test xv6_fixture xv6_shell_runs_basic_user_programs -- --ignored --nocapture` 通过。
+
+完整变更目的和实现分析见 [xv6 支持变更分析](./xv6-change-analysis.md)。

@@ -4,4 +4,4 @@
 
 - [当前仓库实现说明](./repository-status.md)：按模块说明内容、作用、当前进度和待办。
 - [Testbench 说明](./testbench.md)：说明以 xv6 为目标的测试分层、运行命令和完整 xv6 契约测试。
-
+- [xv6 支持变更分析](./xv6-change-analysis.md)：分析本轮代码更改、目的、风险和验证证据。
