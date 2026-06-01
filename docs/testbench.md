@@ -57,6 +57,18 @@ scripts/run_testbench.sh --future-contracts
 scripts/run_testbench.sh --xv6-contracts
 ```
 
+交互式启动 xv6 并进入 shell：
+
+```sh
+scripts/run_xv6_cli.sh
+```
+
+该脚本会复用 testbench 的 xv6 fixture、PLIC、virtio 和 UART 模型，启动到 xv6 shell 后把终端输入转发到 guest UART。按 `Ctrl-]` 退出。只想验证能启动到第一个 shell prompt 时可以运行：
+
+```sh
+scripts/run_xv6_cli.sh --boot-only
+```
+
 ## xv6 完整运行覆盖范围
 
 xv6 契约测试位于 `tests/xv6_fixture.rs`，默认 ignored。它们覆盖以下阶段：
