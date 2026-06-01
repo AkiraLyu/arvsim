@@ -4,6 +4,9 @@ use std::collections::BTreeMap;
 pub trait MemDevice {
     fn read(&mut self, addr: u64, size: usize) -> Result<u64, Exception>;
     fn write(&mut self, addr: u64, value: u32, size: usize) -> Result<(), Exception>;
+    fn pending_interrupt(&mut self) -> Option<u64> {
+        None
+    }
 }
 
 pub struct Bus {
@@ -96,4 +99,3 @@ mod tests {
         }
     }
 }
-

@@ -11,6 +11,8 @@ pub const MIE: usize = 0x304;
 pub const MTVEC: usize = 0x305;
 /// Machine counter enable.
 pub const MCOUNTEREN: usize = 0x306;
+/// Machine environment configuration.
+pub const MENVCFG: usize = 0x30a;
 /// Scratch register for machine trap handlers.
 pub const MSCRATCH: usize = 0x340;
 /// Machine exception program counter.
@@ -41,32 +43,44 @@ pub const STVAL: usize = 0x143;
 pub const SIP: usize = 0x144;
 /// Supervisor address translation and protection.
 pub const SATP: usize = 0x180;
+/// Supervisor timer compare.
+pub const STIMECMP: usize = 0x14d;
 
+// Unprivileged counters and timers.
+pub const TIME: usize = 0xc01;
 
 // mstatus and sstatus field mask
-pub const MASK_SIE: u64 = 1 << 1; 
+pub const MASK_SIE: u64 = 1 << 1;
 pub const MASK_MIE: u64 = 1 << 3;
-pub const MASK_SPIE: u64 = 1 << 5; 
-pub const MASK_UBE: u64 = 1 << 6; 
+pub const MASK_SPIE: u64 = 1 << 5;
+pub const MASK_UBE: u64 = 1 << 6;
 pub const MASK_MPIE: u64 = 1 << 7;
-pub const MASK_SPP: u64 = 1 << 8; 
+pub const MASK_SPP: u64 = 1 << 8;
 pub const MASK_VS: u64 = 0b11 << 9;
 pub const MASK_MPP: u64 = 0b11 << 11;
-pub const MASK_FS: u64 = 0b11 << 13; 
-pub const MASK_XS: u64 = 0b11 << 15; 
+pub const MASK_FS: u64 = 0b11 << 13;
+pub const MASK_XS: u64 = 0b11 << 15;
 pub const MASK_MPRV: u64 = 1 << 17;
-pub const MASK_SUM: u64 = 1 << 18; 
-pub const MASK_MXR: u64 = 1 << 19; 
+pub const MASK_SUM: u64 = 1 << 18;
+pub const MASK_MXR: u64 = 1 << 19;
 pub const MASK_TVM: u64 = 1 << 20;
 pub const MASK_TW: u64 = 1 << 21;
 pub const MASK_TSR: u64 = 1 << 22;
-pub const MASK_UXL: u64 = 0b11 << 32; 
+pub const MASK_UXL: u64 = 0b11 << 32;
 pub const MASK_SXL: u64 = 0b11 << 34;
 pub const MASK_SBE: u64 = 1 << 36;
 pub const MASK_MBE: u64 = 1 << 37;
-pub const MASK_SD: u64 = 1 << 63; 
-pub const MASK_SSTATUS: u64 = MASK_SIE | MASK_SPIE | MASK_UBE | MASK_SPP | MASK_FS 
-                            | MASK_XS  | MASK_SUM  | MASK_MXR | MASK_UXL | MASK_SD;
+pub const MASK_SD: u64 = 1 << 63;
+pub const MASK_SSTATUS: u64 = MASK_SIE
+    | MASK_SPIE
+    | MASK_UBE
+    | MASK_SPP
+    | MASK_FS
+    | MASK_XS
+    | MASK_SUM
+    | MASK_MXR
+    | MASK_UXL
+    | MASK_SD;
 
 // MIP / SIP field mask
 pub const MASK_SSIP: u64 = 1 << 1;
@@ -83,7 +97,9 @@ pub struct Csr {
 }
 impl Csr {
     pub fn new() -> Csr {
-        Self { csrs: [0; NUM_CSRS] }
+        Self {
+            csrs: [0; NUM_CSRS],
+        }
     }
 
     pub fn load(&self, addr: usize) -> u64 {
@@ -97,13 +113,21 @@ impl Csr {
 
     pub fn store(&mut self, addr: usize, value: u64) {
         match addr {
-            SIE => self.csrs[MIE] = (self.csrs[MIE] & !self.csrs[MIDELEG]) | (value & self.csrs[MIDELEG]),
-            SIP => self.csrs[MIP] = (self.csrs[MIE] & !self.csrs[MIDELEG]) | (value & self.csrs[MIDELEG]),
-            SSTATUS => self.csrs[MSTATUS] = (self.csrs[MSTATUS] & !MASK_SSTATUS) | (value & MASK_SSTATUS),
+            SIE => {
+                self.csrs[MIE] =
+                    (self.csrs[MIE] & !self.csrs[MIDELEG]) | (value & self.csrs[MIDELEG])
+            }
+            SIP => {
+                self.csrs[MIP] =
+                    (self.csrs[MIE] & !self.csrs[MIDELEG]) | (value & self.csrs[MIDELEG])
+            }
+            SSTATUS => {
+                self.csrs[MSTATUS] = (self.csrs[MSTATUS] & !MASK_SSTATUS) | (value & MASK_SSTATUS)
+            }
             _ => self.csrs[addr] = value,
         }
     }
-    
+
     pub fn dump_csr(&self) {
         for (i, &value) in self.csrs.iter().enumerate() {
             if value != 0 {
