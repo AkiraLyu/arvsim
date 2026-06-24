@@ -136,3 +136,9 @@ impl Csr {
         }
     }
 }
+
+impl Default for Csr {
+    fn default() -> Self {
+        Self::new()
+    }
+}

@@ -570,11 +570,7 @@ fn execute_mul_div(lhs: u64, rhs: u64, funct3: u8) -> u64 {
         0x3 => (((lhs as u128) * (rhs as u128)) >> 64) as u64,
         0x4 => div_signed(lhs, rhs),
         0x5 => {
-            if rhs == 0 {
-                u64::MAX
-            } else {
-                lhs / rhs
-            }
+            lhs.checked_div(rhs).unwrap_or(u64::MAX)
         }
         0x6 => rem_signed(lhs, rhs),
         0x7 => {
@@ -639,7 +635,7 @@ fn div_signed_32(lhs: u64, rhs: u64) -> u64 {
 fn div_unsigned_32(lhs: u64, rhs: u64) -> u64 {
     let lhs = lhs as u32;
     let rhs = rhs as u32;
-    sign_extend32(if rhs == 0 { u32::MAX } else { lhs / rhs })
+    sign_extend32(lhs.checked_div(rhs).unwrap_or(u32::MAX))
 }
 
 fn rem_signed_32(lhs: u64, rhs: u64) -> u64 {
@@ -870,7 +866,7 @@ fn c_rs2_prime(raw: u16) -> u8 {
 
 fn c_imm6(raw: u16) -> u64 {
     sign_extend(
-        (((raw as u64 >> 7) & 0x20) | ((raw as u64 >> 2) & 0x1f)) as u64,
+        ((raw as u64 >> 7) & 0x20) | ((raw as u64 >> 2) & 0x1f),
         6,
     )
 }

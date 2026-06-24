@@ -63,6 +63,12 @@ impl MemDevice for Dram {
     }
 }
 
+impl Default for Dram {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

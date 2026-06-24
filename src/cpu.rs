@@ -650,7 +650,7 @@ impl Cpu {
     }
 
     fn xv6_kfree_page(&mut self, page: u64) -> Result<bool, Exception> {
-        if page & 0xfff != 0 || page < XV6_END || page >= crate::cfg::DRAM_END {
+        if page & 0xfff != 0 || !(XV6_END..crate::cfg::DRAM_END).contains(&page) {
             return Ok(false);
         }
 
