@@ -66,6 +66,12 @@ impl MemDevice for Bus {
     }
 }
 
+impl  Default for Bus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
