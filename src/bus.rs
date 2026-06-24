@@ -10,63 +10,80 @@ pub trait MemDevice {
 }
 
 pub struct Bus {
-    ram_map: BTreeMap<u64, Box<dyn MemDevice>>,
-    uart_map: BTreeMap<u64, Box<dyn MemDevice>>,
+    devices: BTreeMap<u64, DeviceRegion>,
+}
+
+pub struct DeviceRegion {
+    pub base: u64,
+    pub size: u64,
+    pub dev: Box<dyn MemDevice>,
 }
 
 impl Bus {
     pub fn new() -> Self {
         Bus {
-            ram_map: BTreeMap::new(),
-            uart_map: BTreeMap::new(),
+            devices: BTreeMap::new(),
         }
     }
 
     pub fn attach_ram(&mut self, base: u64, dev: Box<dyn MemDevice>) {
-        self.ram_map.insert(base, dev);
+        self.attach_device(base, crate::cfg::DRAM_SIZE as u64, dev);
     }
 
     pub fn attach_uart(&mut self, base: u64, dev: Box<dyn MemDevice>) {
-        self.uart_map.insert(base, dev);
+        self.attach_device(base, 0x100, dev);
     }
 
-    fn find_dev(
-        map: &mut BTreeMap<u64, Box<dyn MemDevice>>,
-        addr: u64,
-    ) -> Option<&mut Box<dyn MemDevice>> {
-        let mut key = None;
-        for k in map.keys() {
-            if *k <= addr {
-                key = Some(*k);
-            }
+    pub fn attach_device(&mut self, base: u64, size: u64, dev: Box<dyn MemDevice>) {
+        assert!(size > 0, "device region size must be non-zero");
+        let end = base.checked_add(size).expect("device region end overflow");
+
+        if let Some((_, prev)) = self.devices.range(..=base).next_back() {
+            let prev_end = prev
+                .base
+                .checked_add(prev.size)
+                .expect("device region end overflow");
+            assert!(prev_end <= base, "device region overlaps");
         }
-        key.and_then(move |k| map.get_mut(&k))
+        if let Some((&next_base, _)) = self.devices.range(base..).next() {
+            assert!(end <= next_base, "device region overlaps");
+        }
+
+        self.devices.insert(base, DeviceRegion { base, size, dev });
+    }
+
+    fn find_dev(&mut self, addr: u64, size: usize) -> Option<&mut Box<dyn MemDevice>> {
+        let size = u64::try_from(size).ok()?;
+        let (_, region) = self.devices.range_mut(..=addr).next_back()?;
+        let end = addr.checked_add(size)?;
+        let region_end = region.base.checked_add(region.size)?;
+        (end <= region_end).then_some(&mut region.dev)
     }
 }
 
 impl MemDevice for Bus {
     fn read(&mut self, addr: u64, size: usize) -> Result<u64, Exception> {
-        if let Some(dev) = Self::find_dev(&mut self.ram_map, addr) {
-            return dev.read(addr, size);
-        }
-        if let Some(dev) = Self::find_dev(&mut self.uart_map, addr) {
+        if let Some(dev) = self.find_dev(addr, size) {
             return dev.read(addr, size);
         }
         Err(Exception::LoadAccessFault(addr))
     }
 
     fn write(&mut self, addr: u64, value: u32, size: usize) -> Result<(), Exception> {
-        if let Some(dev) = Self::find_dev(&mut self.ram_map, addr) {
-            return dev.write(addr, value, size);
-        }
-        if let Some(dev) = Self::find_dev(&mut self.uart_map, addr) {
+        if let Some(dev) = self.find_dev(addr, size) {
             return dev.write(addr, value, size);
         }
         Err(Exception::StoreAMOAccessFault(addr))
     }
+
+    fn pending_interrupt(&mut self) -> Option<u64> {
+        self.devices
+            .values_mut()
+            .find_map(|region| region.dev.pending_interrupt())
+    }
 }
 
-impl  Default for Bus {
+impl Default for Bus {
     fn default() -> Self {
         Self::new()
     }
@@ -76,6 +93,18 @@ impl  Default for Bus {
 mod tests {
     use super::*;
     use crate::dram::Dram;
+
+    struct FixedDevice;
+
+    impl MemDevice for FixedDevice {
+        fn read(&mut self, _addr: u64, _size: usize) -> Result<u64, Exception> {
+            Ok(0xaa)
+        }
+
+        fn write(&mut self, _addr: u64, _value: u32, _size: usize) -> Result<(), Exception> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn test_bus_read_write() {
@@ -103,5 +132,21 @@ mod tests {
             let val = bus.read(base + i as u64, 1).unwrap();
             assert_eq!(val, (i + 1) as u64);
         }
+    }
+
+    #[test]
+    fn test_bus_checks_device_region_size() {
+        let mut bus = Bus::new();
+        bus.attach_device(0x1000, 0x10, Box::new(FixedDevice));
+
+        assert_eq!(bus.read(0x100f, 1).unwrap(), 0xaa);
+        assert!(matches!(
+            bus.read(0x1010, 1),
+            Err(Exception::LoadAccessFault(0x1010))
+        ));
+        assert!(matches!(
+            bus.write(0x1010, 0, 1),
+            Err(Exception::StoreAMOAccessFault(0x1010))
+        ));
     }
 }
