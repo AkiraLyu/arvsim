@@ -5,9 +5,6 @@ use arvsim::{bus, cfg, cpu, dram, uart};
 fn main() {
     let mut args = args();
 
-    // 获取程序路径
-    let _program = args.next();
-
     // 获取二进制文件
     let bin_path = match args.next() {
         Some(path) => path,
