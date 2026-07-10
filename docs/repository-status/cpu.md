@@ -1,54 +1,42 @@
-# `src/cpu.rs`：CPU、地址翻译和 xv6 运行时支撑
+# `src/cpu.rs`：CPU、MMU、trap 与 xv6 快速路径
 
-## 设计
+## 功能与实现思路
 
-- CPU 是解释执行核心：每步推进时间、处理中断、尝试 xv6 专用加速路径、取指、执行、更新 PC。
-- 特权级没有作为独立状态机完整建模，当前主要通过 PC 范围和 CSR 位满足 xv6 路径。
-- xv6 热点函数使用硬编码符号地址加速，目标是让验收测试在可接受时间内完成。
+`Cpu` 保存 32 个通用寄存器、PC、总线、CSR、软件周期计数以及私有复位向量/初始栈指针。`step()` 的顺序为：周期推进 → 中断 → xv6 快速路径 → 取指/地址翻译 → 解码执行 → PC 更新。`run()` 根据运行选项重复调用 `step()`。CPU 通过 `Box<dyn MemDevice>` 与具体机器解耦。
 
-## 实现
+## 当前状态
 
-- `Cpu` 保存 32 个通用寄存器、PC、总线、CSR 和周期计数。
-- `Cpu::new()` 将 PC 设为 `CPU_START_ADDR`，将 `sp` 设为 `DRAM_END`。
-- `step()` 每次先调用 `tick()`，把 `TIME` 增加 10；随后检查监督模式定时器中断和外部中断。
-- `fetch()` 通过 `translate()` 做取指地址翻译，再从总线读取 4 字节。
-- `execute()` 调用 `instruction::decode()` 和 `instruction::execute()`，并处理普通 4 字节 PC 推进。
-- Sv39 地址翻译支持三级页表、叶子 PTE 判断、R/W/X 权限检查、用户页检查和页错误返回。
-- 同步异常会进入监督模式陷入处理，写入 `SEPC/SCAUSE/STVAL/SSTATUS`，PC 跳到 `STVEC`。
-- `sret` 通过 `supervisor_return()` 恢复 `SSTATUS.SIE/SPIE/SPP` 并返回 `SEPC`。
-- 定时器中断由 `TIME >= STIMECMP` 触发，外部中断通过 `bus.pending_interrupt()` 查询。
+部分实现。单步解释器、监督模式 trap 返回、Sv39 三级页表遍历、计时器中断和外部中断接入已可用，但都是面向单 hart/xv6 的简化语义。`new/reset` 设置 PC 为 DRAM 起点、SP 为 DRAM 末端；每个 `step` 把 `cycles/TIME` 增加 10。
 
-## 接口
+## 对外接口
 
-- `struct Cpu`
-  - `registers: [u64; 32]`
-  - `pc: u64`
-  - `bus: Box<dyn MemDevice>`
-  - `csr: Csr`
-  - `cycles: u64`
-- `enum MemoryAccess`
-  - `Fetch`
-  - `Load`
-  - `Store`
-- `Cpu::new(bus)`
-- `reset()`
-- `step() -> Result<(), Exception>`
-- `run()`
-- `translate(addr, access) -> Result<u64, Exception>`
-- `enter_supervisor_trap(scause, stval)`
-- `supervisor_return()`
-- 调试接口：`dump_pc()`、`dump_registers()`
+- `Cpu` 的 `registers`、`pc`、`bus`、`csr`、`cycles` 公开，复位向量和初始 SP 私有。
+- `MemoryAccess::{Fetch, Load, Store}`。
+- `DebugLevel::{Off, Pc, Full}`、`RunOptions { max_steps, debug }` 和 `RunOutcome`。
+- `Cpu::{new, with_reset_vector, reset, step, run, translate, enter_supervisor_trap, supervisor_return, dump_pc, dump_registers}`。
 
-## xv6 专用加速路径
+## 地址翻译与 trap
 
-- CPU/锁相关：`mycpu`、`myproc`、`holding`、`push_off`、`pop_off`、`acquire`、`release`。
-- 内存和字符串：`memcmp`、`memmove`、`strncmp`、`strncpy`、`strlen`。
-- 页表和内存管理：`freewalk`、`uvmunmap`、`uvmcopy`，内部复用 xv6 页表格式、空闲链表和页分配规则。
-- 进程唤醒：`wakeup` 扫描进程表，把匹配通道上的 sleeping 进程设为 runnable。
-- 用户态无效 `exec` 参数：对不可读的 `argv[0]` 快速返回 `-1`。
+- `satp.mode=0` 直接使用物理地址，mode 8 走 Sv39，其他 mode 返回页错误。
+- 遍历三级 PTE，检查 V、非法 W&&!R、R/W/X 和简单 U 位条件，支持 superpage 地址拼接。
+- 同步异常在 `STVEC != 0` 时统一进入 supervisor trap，写 `SEPC/SCAUSE/STVAL/SSTATUS`。
+- 中断只在 `SSTATUS.SIE` 打开时检查；定时器优先于外部中断。定时器条件为 `TIME >= STIMECMP`，外部中断由总线返回 supervisor external cause。
 
-## 限制
+## xv6 专用快速路径
 
-- `DEBUG` 为 `true` 时 `run()` 输出很多调试信息；测试通常使用 `step()` 避免这个问题。
-- xv6 加速路径绑定当前 xv6 测试环境的符号地址，换 xv6 版本可能需要重新校准。
-- 特权级、委托位过滤、访问权限和中断行为是满足 xv6 的简化模型，不是完整特权架构实现。
+CPU 通过固定 PC 地址替代 xv6 函数执行，包括 `mycpu/myproc`、自旋锁和关中断嵌套、`memcmp/memmove/strncmp/strncpy/strlen`、`uvmunmap/freewalk/uvmcopy`、页分配/释放、`wakeup`，以及用户 `exec` 无效参数特例。相关常量还硬编码了 `cpus`、`proc`、`kmem`、内核末端、结构偏移和步长。完成后通常以 `ra` 作为返回 PC。
+
+## 耦合方式
+
+- 调用 `instruction::{decode,execute}`，后者又直接修改 CPU。
+- 依赖 `csr`、`cfg`、`Exception` 和 `MemDevice`。
+- 快速路径与某个具体 xv6 二进制的符号地址、结构布局和内存分配器强耦合；测试支撑也有一个 `tx_busy` 地址 fallback。
+
+## 已知问题和优化方向
+
+- 没有显式 privilege 字段，而用 `pc < DRAM_BASE` 推断用户态；trap delegation、SPP 和 ecall cause 因此不可靠。
+- `reset()` 现会恢复配置的入口/SP并清空 CSR；`run()` 可报告步数上限或异常，但仍没有 guest 主动 halt/exit 协议。
+- Sv39 未检查虚拟地址 canonical form、A/D 位、superpage PPN 对齐、SUM/MXR、ASID/TLB；页表访存错误也未统一转换为页错误。
+- `STVEC` vectored mode、M-mode trap、delegation 和 pending 位更新不完整。
+- 固定 xv6 地址导致换 commit、编译选项或链接布局即可失效，且快速路径绕开真实指令/锁/内存序语义。
+- 建议下一步优先完善 privilege/trap 状态机和 MMU；将快速路径迁入可选、版本化 accelerator 层，默认通用核心不启用。

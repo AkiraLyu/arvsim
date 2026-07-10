@@ -7,10 +7,44 @@ pub struct Dram {
 
 impl Dram {
     pub fn new() -> Self {
+        Self::with_layout(crate::cfg::DRAM_BASE, crate::cfg::DRAM_SIZE)
+    }
+
+    pub fn with_layout(base: u64, size: usize) -> Self {
         Dram {
-            dram: vec![0; crate::cfg::DRAM_SIZE],
-            base: crate::cfg::DRAM_BASE,
+            dram: vec![0; size],
+            base,
         }
+    }
+
+    pub fn end(&self) -> Option<u64> {
+        self.base.checked_add(self.dram.len() as u64)
+    }
+
+    pub fn load_bytes(&mut self, addr: u64, bytes: &[u8]) -> Result<(), std::io::Error> {
+        let offset = addr
+            .checked_sub(self.base)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| std::io::Error::other("image address is below DRAM base"))?;
+        let end = offset
+            .checked_add(bytes.len())
+            .filter(|end| *end <= self.dram.len())
+            .ok_or_else(|| std::io::Error::other("image segment exceeds DRAM size"))?;
+        self.dram[offset..end].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    pub fn zero_range(&mut self, addr: u64, len: usize) -> Result<(), std::io::Error> {
+        let offset = addr
+            .checked_sub(self.base)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| std::io::Error::other("image address is below DRAM base"))?;
+        let end = offset
+            .checked_add(len)
+            .filter(|end| *end <= self.dram.len())
+            .ok_or_else(|| std::io::Error::other("image segment exceeds DRAM size"))?;
+        self.dram[offset..end].fill(0);
+        Ok(())
     }
 
     pub fn load(&mut self, filename: &str) -> Result<(), std::io::Error> {
@@ -21,12 +55,7 @@ impl Dram {
 
         file.read_to_end(&mut buffer)?;
 
-        if buffer.len() > self.dram.len() {
-            return Err(std::io::Error::other("Binary file exceeds DRAM size"));
-        }
-
-        self.dram[..buffer.len()].copy_from_slice(&buffer);
-        Ok(())
+        self.load_bytes(self.base, &buffer)
     }
 }
 
@@ -122,4 +151,3 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 }
-

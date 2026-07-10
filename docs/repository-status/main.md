@@ -1,25 +1,54 @@
-# `src/main.rs`：命令行运行入口
+# `src/main.rs`：命令行入口
 
-## 设计
+## 功能与实现思路
 
-- 提供一个最小可执行程序，用于把裸二进制加载进 DRAM 并直接运行。
-- 入口保持简单，不复用测试支撑中的 xv6 设备模型。
+命令行入口负责解析运行参数、创建可配置 DRAM、装载 flat/ELF 镜像、按平台选择挂载 UART、创建 CPU，并通过统一的 `Cpu::run(RunOptions)` 执行。参数解析不依赖第三方 crate，错误通过 `ExitCode` 显式返回。
 
-## 实现
+## 当前状态
 
-- 读取第一个命令行参数作为二进制路径。
-- 创建 `Dram` 并调用 `Dram::load()`。
-- 创建 `Uart`，挂载到 `0x10000000`。
-- 创建 `Bus`，挂载 DRAM 和 UART。
-- 创建 `Cpu`，`reset()` 后调用 `run()`。
+已完成原优化清单：
 
-## 接口
+- 正确跳过 `argv[0]`，将唯一位置参数作为 guest 镜像路径。
+- 支持 `-h/--help`、未知参数检查、缺值检查和重复镜像检查。
+- `--format auto|flat|elf` 支持自动识别 ELF 或强制格式。
+- `--platform bare|uart` 选择纯 DRAM 或 DRAM + UART 平台。
+- `--dram-base`、`--dram-size`、`--uart-base` 和 `--entry` 提供平台/入口覆盖。
+- `--max-steps` 默认限制为 1,000,000 步，也可设置 `unlimited`。
+- `--debug off|pc|full` 控制无跟踪、PC 跟踪或完整寄存器/CSR 跟踪。
+- CPU 异常、装载失败和参数错误均返回非零退出码；达到显式步数上限正常返回成功。
+- UART 与 DRAM 区域重叠、地址溢出和入口超出 DRAM 会在组装前被拒绝。
 
-```sh
-cargo run -- <binary_file>
+## 对外接口
+
+```text
+Usage: arvsim [OPTIONS] <IMAGE>
+
+Options:
+  --format <auto|flat|elf>
+  --platform <bare|uart>
+  --dram-base <ADDR>
+  --dram-size <SIZE>
+  --uart-base <ADDR>
+  --entry <ADDR>
+  --max-steps <N|unlimited>
+  --debug <off|pc|full>
+  -h, --help
 ```
 
-## 限制
+数值支持十进制、`0x` 十六进制和下划线；DRAM 大小另外支持 `K/M/G` 与 `KiB/MiB/GiB` 后缀。
 
-- 不支持 ELF、磁盘镜像、交互式输入或 xv6 设备。
-- 因为 `Cpu::run()` 使用调试输出，当前更适合开发观察，不适合作为安静的用户级运行器。
+退出码约定：0 表示帮助或达到步数上限；1 表示镜像装载或 guest 执行异常；2 表示参数或平台配置错误。
+
+## 耦合方式
+
+- 依赖 `loader` 完成格式检测和镜像装载。
+- 依赖 `Dram::with_layout` 和 `Cpu::with_reset_vector` 应用运行时布局。
+- 通过统一 `Bus::attach_device` 挂载 DRAM/UART，不再硬编码第二份 UART 地址。
+- `bare` 和 `uart` 仍是轻量平台，不包含 CLINT、PLIC 或 virtio；xv6 完整平台仍只存在测试支撑中。
+
+## 剩余边界
+
+- 没有 guest 主动 halt/exit 协议；目前正常停止点是步数上限，未被 trap 处理的 guest 异常返回失败。
+- 参数解析使用 UTF-8 `std::env::args()`，不支持非 UTF-8 镜像路径。
+- 平台配置只覆盖 DRAM/UART，尚未升级为可复用的正式 `MachineConfig`。
+- 超大 DRAM 配置可能因宿主分配失败而由分配器终止，未提供稀疏内存或可恢复 OOM。

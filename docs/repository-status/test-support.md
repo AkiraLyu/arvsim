@@ -1,68 +1,36 @@
-# `tests/support/mod.rs`：测试机器和 xv6 设备模型
+# `tests/support/mod.rs`：测试机器与 xv6 平台
 
-## 设计
+## 功能与实现思路
 
-- 测试支撑代码提供比正式 `Bus` 更完整的机器模型，用于集成测试和 xv6 验收测试。
-- 它把 RAM、UART、PLIC、virtio-mmio 块设备、MMIO 日志和 xv6 镜像加载集中在一个 `TestBus` 中。
+该模块把 CPU 集成测试需要的 RAM、UART、PLIC、virtio-blk、MMIO 日志、fixture 路径和外部命令包装成一套测试平台。`TestBus` 以 `Rc<RefCell<TestBusState>>` 共享内部状态，CPU 持有其 clone，测试仍可注入 UART 输入和观察输出。
 
-## 实现
+## 当前状态
 
-- `TestBusState` 保存 RAM、UART 输出、UART 输入队列、PLIC 寄存器、待处理中断位、磁盘镜像、virtio 状态和 MMIO 日志。
-- `TestBus` 用 `Rc<RefCell<TestBusState>>` 共享状态，使测试可以在 CPU 运行后检查 UART 输出或注入输入。
-- RAM 地址范围使用 `cfg::DRAM_BASE`，冒烟测试默认 1 MiB，xv6 测试使用 128 MiB。
-- UART：
-  - 读 RBR 返回输入队列当前字节。
-  - 读 LSR 返回发送空闲位，并在有输入时返回接收就绪位。
-  - 写 THR 追加到 `uart_output`。
-- PLIC：
-  - 基址 `0x0c000000`，大小 `0x04000000`。
-  - 覆盖 UART IRQ 10 的 pending、enable、priority、threshold、claim/complete。
-  - `pending_interrupt()` 在 PLIC 可 claim 时返回监督模式外部中断 `scause`。
-- virtio-mmio 块设备：
-  - 基址 `0x10001000`，大小 `0x1000`。
-  - 队列大小固定为 8。
-  - 支持读取 magic、version、device id、vendor id、队列配置、状态和中断状态。
-  - 写 `QueueNotify` 时解析描述符链，处理块读和块写，更新 used ring，并置位 virtio 中断状态。
-- xv6 辅助：
-  - 从 `target/testbench/xv6-riscv` 加载 `kernel.bin` 和 `fs.img`。
-  - 使用 `riscv64-elf-nm` 查找 `tx_busy`，找不到时回退到固定地址，避免测试 UART 缺少真实发送中断导致 xv6 卡住。
+测试专用但功能较完整：
 
-## 接口
+- RAM：1 MiB smoke 配置或 128 MiB xv6 配置，支持 flat binary。
+- UART：输出缓冲、输入队列、LSR RX/TX 状态；有输入时置 PLIC UART pending。
+- PLIC：实现 UART IRQ 10 的 priority、pending、S-mode enable、threshold、claim/complete。
+- virtio-mmio block：实现关键识别/状态/queue 寄存器、大小 8 的单队列、descriptor chain、磁盘读写、used ring 和 interrupt status。
+- 机器控制：固定步数运行、运行到 UART 包含目标文本、失败标记检查。
+- fixture 工具：编译临时 RV64 汇编、定位 kernel/fs 镜像、调用 `nm/readelf` 和验证工具。
 
-- `TestBus`
-  - `new(ram_size)`
-  - `rv64_smoke()`
-  - `xv6_sized()`
-  - `state()`
-  - `load_flat_binary(path)`
-  - `load_disk_image(path)`
-- `TestBusState`
-  - `queue_uart_input(bytes)`
-  - `uart_output_string()`
-  - `mmio_log()`
-- `TestMachine`
-  - `from_bus(bus)`
-  - `with_flat_binary(path, ram_size)`
-  - `run_steps(max_steps)`
-  - `queue_uart_input(input)`
-  - `run_until_uart_contains(needle, max_steps)`
-  - `require_uart_contains(label, needle, max_steps)`
-  - `require_uart_lacks(forbidden)`
-- xv6 工具函数：
-  - `project_root()`
-  - `testbench_target_dir()`
-  - `build_flat_asm(name, asm)`
-  - `xv6_kernel_bin()`
-  - `xv6_kernel_elf()`
-  - `xv6_fs_img()`
-  - `require_xv6_fixture()`
-  - `xv6_machine()`
-  - `require_tool(tool)`
-  - `run(command)`
+## 对外接口
 
-## 限制
+- `MmioAccessKind`、`MmioAccess`。
+- `TestBusState` 的镜像加载、UART 注入/输出、MMIO 日志方法。
+- `TestBus::{new, rv64_smoke, xv6_sized, state, load_flat_binary, load_disk_image}` 和 `MemDevice` 实现。
+- `TestMachine::{from_bus, with_flat_binary, run_steps, queue_uart_input, run_until_uart_contains, require_uart_contains, require_uart_lacks}`。
+- `build_flat_asm`、fixture 路径/验证、`xv6_machine`、`require_tool`、`run`。
 
-- 这是测试支撑模型，不是正式 QEMU `virt` 机器实现。
-- PLIC 只覆盖 xv6 当前使用的 UART IRQ 10 路径。
-- virtio 队列大小固定，特性协商和设备行为只覆盖 xv6 的块设备访问路径。
-- 使用 `Rc<RefCell<_>>`，适合单线程测试，不是并发设备模型。
+## 耦合方式
+
+直接依赖正式 `Cpu`、`cfg`、`MemDevice` 和 `Exception`，但没有复用正式 `Bus/Dram/Uart`。virtio 逻辑知道 xv6 `struct buf` 的 data 偏移 88，并清除特定字段；`xv6_machine` 通过 ELF 符号或硬编码地址处理 `tx_busy`，因此与 xv6 版本强耦合。
+
+## 不完善之处和优化方向
+
+- 一个约 800 行文件混合设备、机器、构建器和 shell 工具，职责过多。
+- `RefCell` 的运行时借用检查只适合单线程；状态字段大多私有但脚本通过源码包含方式复用。
+- PLIC 只支持 UART；virtio 未完整实现 feature negotiation、合法状态机、queue 校验和 IRQ 到 PLIC 的连接。
+- 测试 UART 与正式 UART 行为不一致，掩盖 CLI 平台缺口。
+- 应拆为正式 `devices/`、`platform/virt` 和纯测试 helper；让 xv6 特例显式版本化，并增加设备级单元测试与非法描述符测试。

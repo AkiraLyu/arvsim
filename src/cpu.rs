@@ -9,9 +9,35 @@ pub struct Cpu {
     pub bus: Box<dyn MemDevice>,
     pub csr: csr::Csr,
     pub cycles: u64,
+    reset_vector: u64,
+    initial_sp: u64,
 }
 
-pub const DEBUG: bool = true;
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub enum DebugLevel {
+    #[default]
+    Off,
+    Pc,
+    Full,
+}
+
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
+pub struct RunOptions {
+    pub max_steps: Option<u64>,
+    pub debug: DebugLevel,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub enum RunOutcome {
+    StepLimitReached {
+        steps: u64,
+    },
+    Exception {
+        steps: u64,
+        pc: u64,
+        exception: Exception,
+    },
+}
 const XV6_MYCPU: u64 = 0x8000_18e2;
 const XV6_CPUS: u64 = 0x8000_f988;
 const XV6_CPU_STRIDE: u64 = 128;
@@ -58,21 +84,28 @@ pub enum MemoryAccess {
 
 impl Cpu {
     pub fn new(bus: Box<dyn MemDevice>) -> Self {
+        Self::with_reset_vector(bus, crate::cfg::CPU_START_ADDR, crate::cfg::DRAM_END)
+    }
+
+    pub fn with_reset_vector(bus: Box<dyn MemDevice>, reset_vector: u64, initial_sp: u64) -> Self {
         let mut cpu = Cpu {
             registers: [0; 32],
-            pc: crate::cfg::CPU_START_ADDR,
+            pc: reset_vector,
             bus,
             csr: csr::Csr::new(),
             cycles: 0,
+            reset_vector,
+            initial_sp,
         };
-        cpu.registers[2] = crate::cfg::DRAM_END;
+        cpu.registers[2] = initial_sp;
         cpu
     }
 
     pub fn reset(&mut self) {
         self.registers = [0; 32];
-        self.registers[2] = crate::cfg::DRAM_END;
-        self.pc = crate::cfg::CPU_START_ADDR;
+        self.registers[2] = self.initial_sp;
+        self.pc = self.reset_vector;
+        self.csr = csr::Csr::new();
         self.cycles = 0;
     }
 
@@ -98,26 +131,32 @@ impl Cpu {
         Ok(())
     }
 
-    pub fn run(&mut self) {
+    pub fn run(&mut self, options: RunOptions) -> RunOutcome {
+        let mut steps = 0;
         loop {
-            if DEBUG {
-                self.dump_pc();
-                self.dump_registers();
-                self.csr.dump_csr();
+            if options.max_steps.is_some_and(|limit| steps >= limit) {
+                return RunOutcome::StepLimitReached { steps };
             }
-            let instruction = match self.fetch() {
-                Ok(instruction) => instruction,
-                Err(_) => {
-                    eprintln!("Failed to fetch instruction at pc: {:#x}", self.pc);
-                    break;
+
+            match options.debug {
+                DebugLevel::Off => {}
+                DebugLevel::Pc => self.dump_pc(),
+                DebugLevel::Full => {
+                    self.dump_pc();
+                    self.dump_registers();
+                    self.csr.dump_csr();
                 }
-            };
-            match self.execute(instruction) {
-                Ok(new_pc) => self.pc = new_pc,
-                Err(e) => {
-                    println!("Failed to execute because of {:?}", e);
-                }
-            };
+            }
+
+            let pc = self.pc;
+            if let Err(exception) = self.step() {
+                return RunOutcome::Exception {
+                    steps,
+                    pc,
+                    exception,
+                };
+            }
+            steps = steps.wrapping_add(1);
         }
     }
 
@@ -144,25 +183,6 @@ impl Cpu {
                 if self.trap_exception(e) {
                     return Ok(self.pc);
                 }
-                match &e {
-                    Exception::IllegalInstruction(addr) => {
-                        eprintln!("Illegal instruction at address: 0x{:016x}", addr);
-                    }
-                    Exception::LoadAccessFault(addr)
-                    | Exception::StoreAMOAccessFault(addr)
-                    | Exception::InstructionAccessFault(addr) => {
-                        eprintln!("Memory access error at address: 0x{:016x}", addr);
-                    }
-                    Exception::InstructionAddrMisaligned(addr)
-                    | Exception::LoadAccessMisaligned(addr)
-                    | Exception::StoreAMOAddrMisaligned(addr) => {
-                        eprintln!("Misaligned memory access at address: 0x{:016x}", addr);
-                    }
-                    _ => {
-                        eprintln!("Exception occurred: {:?}", e);
-                    }
-                }
-                self.pc += 4;
                 Err(e)
             }
         }
@@ -873,4 +893,46 @@ fn exception_trap_info(exception: Exception) -> Option<(u64, u64)> {
         Exception::StoreAMOPageFault(addr) => (15, addr),
     };
     Some(info)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dram::Dram;
+
+    #[test]
+    fn run_reuses_step_and_stops_at_the_limit() {
+        let base = 0x8000_0000;
+        let mut dram = Dram::with_layout(base, 16);
+        dram.load_bytes(base, &[0x93, 0x0f, 0xa0, 0x02]).unwrap();
+        let mut cpu = Cpu::with_reset_vector(Box::new(dram), base, base + 16);
+
+        let outcome = cpu.run(RunOptions {
+            max_steps: Some(1),
+            debug: DebugLevel::Off,
+        });
+
+        assert!(matches!(outcome, RunOutcome::StepLimitReached { steps: 1 }));
+        assert_eq!(cpu.pc, base + 4);
+        assert_eq!(cpu.registers[31], 42);
+        assert_eq!(cpu.cycles, TIMER_CYCLES_PER_STEP);
+    }
+
+    #[test]
+    fn reset_restores_configured_entry_stack_and_csrs() {
+        let base = 0x9000_0000;
+        let mut cpu =
+            Cpu::with_reset_vector(Box::new(Dram::with_layout(base, 16)), base + 4, base + 16);
+        cpu.pc = base + 8;
+        cpu.registers[2] = 0;
+        cpu.csr.store(csr::SATP, 123);
+        cpu.cycles = 99;
+
+        cpu.reset();
+
+        assert_eq!(cpu.pc, base + 4);
+        assert_eq!(cpu.registers[2], base + 16);
+        assert_eq!(cpu.csr.load(csr::SATP), 0);
+        assert_eq!(cpu.cycles, 0);
+    }
 }

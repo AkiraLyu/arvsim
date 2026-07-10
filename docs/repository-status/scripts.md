@@ -1,30 +1,28 @@
-# 脚本
+# `scripts/`：构建、测试与交互运行
 
-## 设计
+## `build_xv6_fixture.sh`
 
-- 脚本把常用测试和 xv6 构件构建流程固定下来，避免手工重复输入长命令。
+检查宿主和 RISC-V 工具，克隆或更新 `mit-pdos/xv6-riscv` 的默认 `riscv` 分支，构建 kernel/fs.img，将 ELF 转为 flat binary，并生成 `fixture.env`。支持 `XV6_DIR`、`XV6_REPO`、`XV6_REF`、`TOOLPREFIX`。
 
-## 实现和接口
+状态：可用，但默认跟踪可变分支而非固定 commit；已有 checkout 刷新失败时会静默复用旧版本，可能与 CPU 的硬编码符号地址不一致。
 
-- `scripts/build_xv6_fixture.sh`
-  - 检查 `git`、`make`、`gcc`、`perl`、`riscv64-elf-gcc`、`riscv64-elf-objcopy`、`riscv64-elf-readelf`。
-  - 默认从 `https://github.com/mit-pdos/xv6-riscv.git` 的 `riscv` 分支构建。
-  - 生成 `kernel/kernel`、`kernel/kernel.bin`、`fs.img` 和 `fixture.env`。
-  - 可用 `XV6_DIR`、`XV6_REPO`、`XV6_REF`、`TOOLPREFIX` 覆盖默认值。
-- `scripts/run_testbench.sh`
-  - 无参数运行 `cargo test`。
-  - `--with-xv6-fixture` 先构建 xv6 构件，再运行稳定测试。
-  - `--future-contracts` 运行默认测试、默认忽略的 RV64 测试和默认忽略的 xv6 测试。
-  - `--xv6-contracts` 构建 xv6 构件并运行 xv6 忽略测试。
-- `scripts/run_xv6_cli.sh`
-  - 自动确保 xv6 构件存在。
-  - 构建 release 版库，再生成一个临时 Rust 运行器。
-  - 复用 `tests/support/mod.rs` 的 xv6 测试机器。
-  - 默认进入交互模式，把主机终端输入转发到 xv6 UART；按 `Ctrl-]` 退出。
-  - `--boot-only` 启动到第一个 shell 提示符后退出。
-  - `--build-fixture` 强制重建 xv6 构件。
+## `run_testbench.sh`
 
-## 限制
+提供默认测试、先构建 fixture、运行所有 ignored 合同和只运行 xv6 合同四种模式。`--future-contracts` 本身不构建 fixture，若本地缺少构件会导致 xv6 ignored 测试失败。帮助文字仍宣称 future tests 预期失败，与部分已有实现不一致。
 
-- `run_testbench.sh` 的帮助文本仍使用旧的 “future-contract” 英文说明；脚本行为本身可用。
-- `run_xv6_cli.sh` 通过生成临时 Rust 文件复用测试支撑代码，是最短可用路径，不是长期 CLI 架构。
+## `run_xv6_cli.sh`
+
+确保 fixture 存在、构建 release 库，在 `target/testbench/generated` 写入临时 Rust runner，源码包含 `tests/support/mod.rs`，再用 `rustc` 链接 rlib。交互模式将 stdin 字节送入测试 UART，输出 guest UART；`Ctrl-]` 退出，`--boot-only` 到 shell prompt 后退出。
+
+状态：能复用测试平台快速形成交互入口，但不是正式 CLI。它通过 shell here-doc 生成 Rust 源码、从 deps 中取第一个匹配 rlib，并依赖测试模块的非稳定接口。
+
+## 对外接口与耦合
+
+- `scripts/run_testbench.sh [--with-xv6-fixture|--future-contracts|--xv6-contracts]`
+- `scripts/run_xv6_cli.sh [--build-fixture] [--boot-only]`
+- 强依赖 Bash、Git、Make、GCC、Perl、RISC-V binutils/GCC、网络和上游 xv6。
+- 交互脚本还依赖 `cargo/rustc/find/stty` 和测试支撑源码布局。
+
+## 优化方向
+
+固定并校验 xv6 commit；将 runner 做成 Cargo binary/example；由正式平台构建器供 CLI 与测试共用；自动发现 tool prefix；明确 skip/fail 语义；在 CI 中缓存 fixture 并分离 smoke/nightly 测试档位。

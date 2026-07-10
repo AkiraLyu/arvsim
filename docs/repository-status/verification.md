@@ -1,30 +1,39 @@
-# 验证结果和后续工作
+# 验证记录
 
-## 当前验证结果
+## 本轮执行结果
 
-已验证命令：
+执行日期：2026-07-10。分析基线：提交 `2f64e7a` 加当前工作树中的 CLI、loader、CPU/DRAM API、测试和文档变更。
 
-```sh
-scripts/run_testbench.sh
-cargo test --test xv6_fixture xv6_runs_quick_usertests -- --ignored --nocapture
-cargo test --release --test xv6_fixture xv6_runs_full_usertests_suite -- --ignored --nocapture
-cargo test --release --test xv6_fixture xv6_shell_runs_basic_user_programs -- --ignored --nocapture
-git diff --check
-```
+### `cargo test`
 
-验证结果：
+结果：通过。
 
-- 稳定测试套件通过。
-- xv6 快速 `usertests` 在 debug 模式的测试框架下通过。
-- xv6 完整 `usertests` 在 release 模式的测试框架下通过，并输出 `ALL TESTS PASSED`。
-- shell 基础用户程序在 release 模式的测试框架下通过。
-- diff 空白检查通过。
+- 库单元测试：15 passed。
+- `src/main.rs`：4 passed。
+- `tests/cli.rs`：3 passed。
+- `tests/rv64i_smoke.rs`：2 passed，1 ignored。
+- `tests/xv6_fixture.rs`：1 passed，4 ignored。
+- doc tests：0 tests。
 
-## 主要边界和后续工作
+完成 CLI 优化后默认回归一共实际执行 25 个测试：库 15 个、CLI 单元 4 个、CLI 进程集成 3 个、RV64 集成 2 个、fixture 检查 1 个；另有 5 个测试被忽略。新增覆盖包括 flat/ELF 装载、BSS 清零、参数解析、区域重叠、真实进程退出码、`Cpu::run()` 步数限制和可配置复位/CSR 清理。仍未覆盖 CPU trap/MMU/interrupt、正式 UART 输入、CLINT/PLIC 或 xv6 行为合同。
 
-- 把 `src/clint.rs`、`src/plic.rs` 从占位文件扩展为正式设备模型。
-- 将测试支撑中的 PLIC、virtio、UART 输入能力迁移或抽象到正式机器模型。
-- 将 xv6 专用加速路径从硬编码地址改为符号驱动、配置开关或可替换策略。
-- 建模完整特权级状态机、CSR 权限、委托位过滤和多 hart 原子语义。
-- 引入官方 riscv-tests 或更系统的 ISA 规范一致性测试。
-- 清理测试和脚本中的旧 “future contract” 标签文本，使命名和当前状态一致。
+`cargo clippy --lib --bin arvsim -- -D warnings` 通过。`cargo clippy --all-targets -- -D warnings` 仍被既有 `tests/support/mod.rs` 的两个 lint 阻断（单元素循环和可改为范围的 OR pattern），与本次 CLI 改动无关。
+
+### `cargo test --test rv64i_smoke -- --ignored`
+
+结果：失败。
+
+`rv64i_memory_branch_and_x0_contract` 在第 9 步以 `IllegalInstruction(0)` 失败。汇编的成功控制流只执行 8 条指令，故该结果首先暴露的是测试步数/终止协议问题，不能据此断言 load/store/branch/jump 语义失败。
+
+### 未执行项
+
+未运行 `cargo test --test xv6_fixture -- --ignored`：四个测试需要外部 fixture，最长预算为 20 亿步，不适合作为本轮文档核验的即时命令。仓库历史文档曾记录通过结果，但当前默认测试不能复核该结论。
+
+## 覆盖缺口
+
+- CLI 已有参数单元测试和 3 个真实进程测试，但 ELF、调试输出、UART 平台与 guest exception 进程路径尚未覆盖。
+- CPU 新增运行循环和 reset 单元测试；关键特权、trap、MMU 和中断语义仍主要依赖默认关闭的 xv6 黑盒测试。
+- Bus 只测基本区域末端，没有重叠、溢出、零尺寸和中断顺序测试。
+- 指令测试仅有解码和立即数小测试，大部分执行语义没有精确回归。
+- 测试 PLIC/virtio 没有独立设备测试。
+- 没有自动化 clippy/格式、Miri、fuzz、riscv-arch-test 或覆盖率门槛的仓库配置。

@@ -5,6 +5,7 @@ pub mod cpu;
 pub mod csr;
 pub mod dram;
 pub mod instruction;
+pub mod loader;
 pub mod plic;
 pub mod trap;
 pub mod uart;

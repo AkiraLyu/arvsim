@@ -1,31 +1,33 @@
-# `src/bus.rs`：内存设备抽象和总线
+# `src/bus.rs`：内存设备抽象与总线
 
-## 设计
+## 功能与实现思路
 
-- `MemDevice` 是所有内存映射设备的最小接口。
-- `Bus` 负责按基址把 CPU 读写分发到 DRAM 或 UART 类设备。
-- 中断查询用 `pending_interrupt()` 放在 `MemDevice` 默认方法里，避免为测试设备另建一套总线接口。
+`MemDevice` 把 CPU 的物理地址读写抽象成统一 trait；`Bus` 用以基址为键的 `BTreeMap` 保存不重叠的半开区间，并把访问转发给包含完整访问宽度的设备。总线也轮询设备的待处理中断。
 
-## 实现
+## 当前状态
 
-- `Bus` 内部有两个 `BTreeMap<u64, Box<dyn MemDevice>>`：一个用于 RAM，一个用于 UART 类设备。
-- 查找设备时选择不大于访问地址的最大基址，然后把原始物理地址交给设备处理。
-- 未命中的读返回 `LoadAccessFault`，未命中的写返回 `StoreAMOAccessFault`。
-- 当前 `Bus` 自身没有覆盖 `pending_interrupt()`，所以正式总线默认不会主动产生外部中断。
+核心分发已实现。挂载时检查非零尺寸、地址溢出以及与前后区域重叠；访问未命中分别返回 load/store access fault。与旧设计不同，当前所有设备已统一保存在一张区域表中。
 
-## 接口
+## 对外接口
 
 - `trait MemDevice`
-  - `read(&mut self, addr: u64, size: usize) -> Result<u64, Exception>`
-  - `write(&mut self, addr: u64, value: u32, size: usize) -> Result<(), Exception>`
-  - `pending_interrupt(&mut self) -> Option<u64>`
-- `struct Bus`
-  - `Bus::new()`
-  - `attach_ram(base, dev)`
-  - `attach_uart(base, dev)`
+  - `read(&mut self, addr, size) -> Result<u64, Exception>`
+  - `write(&mut self, addr, value: u32, size) -> Result<(), Exception>`
+  - `pending_interrupt(&mut self) -> Option<u64>`，默认无中断
+- `Bus::{new, attach_device, attach_ram, attach_uart}`
+- `DeviceRegion { base, size, dev }`
+- `Bus: Default + MemDevice`
 
-## 限制
+## 耦合方式
 
-- `write()` 的值参数是 `u32`。64 位写入由 CPU 或设备层拆成两次 32 位写。
-- `Bus` 没有设备尺寸表，实际越界检查由设备自己完成。
-- 设备分类目前只有 RAM 和 UART 两张表，正式平台设备还没有统一抽象。
+- 依赖 `trap::Exception`；`attach_ram` 依赖 `cfg::DRAM_SIZE`。
+- `Cpu` 只持有 `Box<dyn MemDevice>`，因此既可接正式 `Bus`，也可接测试 `TestBus`。
+- DRAM 和 UART 实现该 trait；中断 cause 以裸 `u64` 由设备上传。
+
+## 不完善之处和优化方向
+
+- `write` 只有 `u32` 值，64 位写被上层拆成两次，破坏设备看到的访问原子性。
+- `size` 未限制为 1/2/4/8，零宽访问也可能命中。
+- `attach_ram` 固定声明 128 MiB，无法表达实际设备大小；`attach_uart` 固定 256 字节。
+- `pending_interrupt` 按地址顺序取第一个，不具备优先级/仲裁语义。
+- 建议改用 `u64` 写值和显式 `AccessSize`，让设备报告区域描述，定义类型化中断，并加入设备移除、只读查询和更完整的边界测试。
