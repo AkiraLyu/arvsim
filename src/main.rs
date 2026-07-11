@@ -1,6 +1,12 @@
-use arvsim::cpu::{Cpu, DebugLevel, RunOptions, RunOutcome};
+//! arvsim 命令行入口。
+//!
+//! 入口把参数解析、镜像装载和机器组装串联起来；CPU 执行由库中的 [`arvsim::machine::Machine`] 完成。
+//! 参数或平台配置错误返回退出码 2，宿主装载失败或未被 guest trap 接管的异常返回退出码 1。
+
+use arvsim::cfg;
+use arvsim::cpu::{DebugLevel, RunOptions, RunOutcome};
 use arvsim::loader::{self, ImageFormat};
-use arvsim::{bus, cfg, dram, uart};
+use arvsim::machine::Platform;
 use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -8,7 +14,8 @@ use std::process::ExitCode;
 const DEFAULT_MAX_STEPS: u64 = 1_000_000;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-enum Platform {
+enum PlatformPreset {
+    // `Bare` 仍有 DRAM，只是不挂载 UART MMIO 窗口。
     Bare,
     Uart,
 }
@@ -17,7 +24,7 @@ enum Platform {
 struct CliOptions {
     image: PathBuf,
     format: ImageFormat,
-    platform: Platform,
+    platform: PlatformPreset,
     dram_base: u64,
     dram_size: usize,
     uart_base: u64,
@@ -50,33 +57,15 @@ fn main() -> ExitCode {
 }
 
 fn run(options: CliOptions) -> ExitCode {
-    let dram_size_u64 = match u64::try_from(options.dram_size) {
-        Ok(size) if size > 0 => size,
-        _ => {
-            eprintln!("error: DRAM size must be a non-zero value representable as u64");
+    // 平台层在分配内存和挂载设备前统一验证地址范围。
+    let mut platform = match Platform::new(options.dram_base, options.dram_size) {
+        Ok(platform) => platform,
+        Err(error) => {
+            eprintln!("error: invalid platform configuration: {error}");
             return ExitCode::from(2);
         }
     };
-    let dram_end = match options.dram_base.checked_add(dram_size_u64) {
-        Some(end) => end,
-        None => {
-            eprintln!("error: DRAM address range overflows u64");
-            return ExitCode::from(2);
-        }
-    };
-    if options.platform == Platform::Uart {
-        let Some(uart_end) = options.uart_base.checked_add(0x100) else {
-            eprintln!("error: UART address range overflows u64");
-            return ExitCode::from(2);
-        };
-        if ranges_overlap(options.dram_base, dram_end, options.uart_base, uart_end) {
-            eprintln!("error: UART and DRAM address ranges overlap");
-            return ExitCode::from(2);
-        }
-    }
-
-    let mut dram = dram::Dram::with_layout(options.dram_base, options.dram_size);
-    let loaded = match loader::load_image(&mut dram, &options.image, options.format) {
+    let loaded = match loader::load_image(platform.dram_mut(), &options.image, options.format) {
         Ok(loaded) => loaded,
         Err(error) => {
             eprintln!(
@@ -87,31 +76,29 @@ fn run(options: CliOptions) -> ExitCode {
         }
     };
     let entry = options.entry.unwrap_or(loaded.entry);
-    if !(options.dram_base..dram_end).contains(&entry) {
-        eprintln!(
-            "error: entry point {entry:#x} is outside DRAM range {:#x}..{dram_end:#x}",
-            options.dram_base
-        );
+    if options.platform == PlatformPreset::Uart
+        && let Err(error) = platform.attach_uart(options.uart_base)
+    {
+        eprintln!("error: invalid UART mapping: {error}");
         return ExitCode::from(2);
     }
 
-    let mut bus = bus::Bus::new();
-    bus.attach_device(options.dram_base, dram_size_u64, Box::new(dram));
-    if options.platform == Platform::Uart {
-        let uart = uart::Uart::new(options.uart_base);
-        bus.attach_device(options.uart_base, 0x100, Box::new(uart));
-    }
-
-    let mut cpu = Cpu::with_reset_vector(Box::new(bus), entry, dram_end);
-    cpu.reset();
-    match cpu.run(RunOptions {
+    let mut machine = match platform.build(entry) {
+        Ok(machine) => machine,
+        Err(error) => {
+            eprintln!("error: failed to build machine: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    machine.reset();
+    match machine.run(RunOptions {
         max_steps: options.max_steps,
         debug: options.debug,
     }) {
         RunOutcome::StepLimitReached { steps } => {
             println!(
                 "stopped after {steps} steps at pc={:#x} (step limit reached)",
-                cpu.pc
+                machine.cpu.pc
             );
             ExitCode::SUCCESS
         }
@@ -131,7 +118,7 @@ where
     I: IntoIterator<Item = String>,
 {
     let mut format = ImageFormat::Auto;
-    let mut platform = Platform::Uart;
+    let mut platform = PlatformPreset::Uart;
     let mut dram_base = cfg::DRAM_BASE;
     let mut dram_size = cfg::DRAM_SIZE;
     let mut uart_base = cfg::UART_BASE;
@@ -154,8 +141,8 @@ where
             }
             "--platform" => {
                 platform = match next_value(&mut args, "--platform")?.as_str() {
-                    "bare" => Platform::Bare,
-                    "uart" => Platform::Uart,
+                    "bare" => PlatformPreset::Bare,
+                    "uart" => PlatformPreset::Uart,
                     value => return Err(format!("invalid platform: {value}")),
                 }
             }
@@ -180,6 +167,7 @@ where
                 }
             }
             "--" => {
+                // `--` 后只接受唯一镜像路径，使以 `-` 开头的文件名不会被当作选项。
                 let value = args
                     .next()
                     .ok_or_else(|| "missing image path after --".to_string())?;
@@ -225,6 +213,7 @@ fn set_image(image: &mut Option<PathBuf>, value: String) -> Result<(), String> {
 }
 
 fn parse_number(value: &str) -> Result<u64, String> {
+    // 先移除仅用于可读性的下划线，再根据前缀选择十进制或十六进制。
     let normalized = value.replace('_', "");
     let (digits, radix) = normalized
         .strip_prefix("0x")
@@ -255,10 +244,6 @@ fn parse_size(value: &str) -> Result<usize, String> {
         .checked_mul(multiplier)
         .ok_or_else(|| format!("size overflows u64: {value}"))?;
     usize::try_from(bytes).map_err(|_| format!("size does not fit usize: {value}"))
-}
-
-fn ranges_overlap(lhs_start: u64, lhs_end: u64, rhs_start: u64, rhs_end: u64) -> bool {
-    lhs_start < rhs_end && rhs_start < lhs_end
 }
 
 fn usage() -> &'static str {
@@ -293,7 +278,7 @@ mod tests {
         assert_eq!(options.image, PathBuf::from("guest.bin"));
         assert_eq!(options.format, ImageFormat::Auto);
         assert_eq!(options.max_steps, Some(DEFAULT_MAX_STEPS));
-        assert_eq!(options.platform, Platform::Uart);
+        assert_eq!(options.platform, PlatformPreset::Uart);
     }
 
     #[test]
@@ -318,7 +303,7 @@ mod tests {
         };
 
         assert_eq!(options.format, ImageFormat::Elf);
-        assert_eq!(options.platform, Platform::Bare);
+        assert_eq!(options.platform, PlatformPreset::Bare);
         assert_eq!(options.dram_size, 64 * 1024 * 1024);
         assert_eq!(options.entry, Some(0x8000_1000));
         assert_eq!(options.max_steps, None);
@@ -329,11 +314,5 @@ mod tests {
     fn rejects_missing_and_duplicate_images() {
         assert!(parse(&[]).is_err());
         assert!(parse(&["one.bin", "two.bin"]).is_err());
-    }
-
-    #[test]
-    fn detects_overlapping_ranges() {
-        assert!(ranges_overlap(0x1000, 0x2000, 0x1800, 0x2800));
-        assert!(!ranges_overlap(0x1000, 0x2000, 0x2000, 0x2800));
     }
 }
