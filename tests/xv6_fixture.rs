@@ -1,3 +1,8 @@
+//! xv6 fixture 的分层验收测试。
+//!
+//! 测试以 UART 文本作为黑盒进度信号，从镜像完整性逐步覆盖启动、shell、基础用户程序和 usertests。
+//! 长时间合同保持 `ignored`，由脚本或显式测试命令运行。
+
 mod support;
 
 use std::error::Error;
@@ -14,6 +19,7 @@ const XV6_FAILURE_MARKERS: &[&str] = &[
 ];
 
 fn budget(name: &str, default: usize) -> usize {
+    // 每个阶段单独配置预算，超时信息才能准确指出卡住的启动或用户态阶段。
     std::env::var(name)
         .ok()
         .and_then(|value| value.parse().ok())
@@ -67,14 +73,14 @@ fn xv6_fixture_artifacts_are_well_formed_when_present() -> Result<(), Box<dyn Er
 }
 
 #[test]
-#[ignore = "future xv6 contract: requires RV64GC, CSRs, privilege transitions, traps, timer, PLIC, and virtio"]
+#[ignore = "opt-in xv6 contract: requires an external fixture and a long execution budget"]
 fn xv6_kernel_reaches_first_shell() -> Result<(), Box<dyn Error>> {
     boot_to_shell()?;
     Ok(())
 }
 
 #[test]
-#[ignore = "future xv6 contract: requires shell, console input, filesystem, user programs, and virtio disk"]
+#[ignore = "opt-in xv6 contract: requires an external fixture and a long execution budget"]
 fn xv6_shell_runs_basic_user_programs() -> Result<(), Box<dyn Error>> {
     let mut machine = boot_to_shell()?;
 
@@ -104,7 +110,7 @@ fn xv6_shell_runs_basic_user_programs() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-#[ignore = "future xv6 contract: requires user mode, syscalls, fork/exec/wait, pipes, filesystem, and timer interrupts"]
+#[ignore = "opt-in xv6 contract: requires an external fixture and a long execution budget"]
 fn xv6_runs_quick_usertests() -> Result<(), Box<dyn Error>> {
     let mut machine = boot_to_shell()?;
     machine.queue_uart_input("usertests -q\n");
@@ -123,7 +129,7 @@ fn xv6_runs_quick_usertests() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-#[ignore = "full xv6 contract: boots to shell and completes the full xv6 usertests suite"]
+#[ignore = "opt-in full xv6 contract: requires an external fixture and up to two billion steps"]
 fn xv6_runs_full_usertests_suite() -> Result<(), Box<dyn Error>> {
     let mut machine = boot_to_shell()?;
     machine.queue_uart_input("usertests\n");

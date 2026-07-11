@@ -1,18 +1,32 @@
+//! 单 hart RV64 CPU 状态和执行循环。
+//!
+//! [`Cpu::step`] 依次推进时间、处理中断、尝试可选 xv6 加速、取指、译码执行并提交 PC。
+//! 地址翻译和监督模式 trap 也集中在本模块；具体物理内存和设备通过 [`MemDevice`] 注入。
+//! 当前实现没有独立的特权级字段，部分监督/用户判断沿用现有 PC 地址范围约定。
+
 use crate::bus::MemDevice;
 use crate::csr;
 use crate::instruction;
 use crate::trap::Exception;
 
+/// 一个 CPU hart 的可观察状态及其总线连接。
 pub struct Cpu {
+    /// 32 个整数寄存器；指令完成后必须保持 `registers[0] == 0`。
     pub registers: [u64; 32],
+    /// 下一条待执行指令的 guest PC。
     pub pc: u64,
+    /// 同时承载物理内存、MMIO 和外部中断查询的设备接口。
     pub bus: Box<dyn MemDevice>,
+    /// 当前 hart 的控制与状态寄存器文件。
     pub csr: csr::Csr,
+    /// 模拟周期计数；每次 `step` 按固定粒度增加。
     pub cycles: u64,
     reset_vector: u64,
     initial_sp: u64,
+    xv6_accelerator: Option<Xv6Accelerator>,
 }
 
+/// 执行循环输出的调试信息级别。
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub enum DebugLevel {
     #[default]
@@ -21,52 +35,67 @@ pub enum DebugLevel {
     Full,
 }
 
+/// [`Cpu::run`] 的停止条件和调试配置。
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
 pub struct RunOptions {
+    /// 最多成功执行的步数；`None` 表示不设上限。
     pub max_steps: Option<u64>,
+    /// 每步执行前输出的状态详细程度。
     pub debug: DebugLevel,
 }
 
+/// [`Cpu::run`] 离开执行循环的原因。
 #[derive(Debug, Copy, Clone)]
 pub enum RunOutcome {
-    StepLimitReached {
-        steps: u64,
-    },
+    /// 已成功执行指定步数，CPU 状态停在下一条指令之前。
+    StepLimitReached { steps: u64 },
+    /// 遇到未被 guest trap 入口接管的异常。
     Exception {
+        /// 异常前已成功完成的步数。
         steps: u64,
+        /// 产生异常的指令 PC。
         pc: u64,
         exception: Exception,
     },
 }
-const XV6_MYCPU: u64 = 0x8000_18e2;
-const XV6_CPUS: u64 = 0x8000_f988;
+
+/// xv6 专用快速路径所需的函数入口和全局对象地址。
+///
+/// 该配置默认关闭，必须与实际加载的 xv6 ELF 符号匹配；错误地址可能在普通指令中间误触发快速路径。
+/// 结构体偏移和数组步长仍由本模块中的兼容性常量约束。
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct Xv6Accelerator {
+    pub mycpu: u64,
+    pub holding: u64,
+    pub push_off: u64,
+    pub acquire: u64,
+    pub pop_off: u64,
+    pub release: u64,
+    pub memcmp: u64,
+    pub memmove: u64,
+    pub strncmp: u64,
+    pub strncpy: u64,
+    pub strlen: u64,
+    pub uvmunmap: u64,
+    pub freewalk: u64,
+    pub uvmcopy: u64,
+    pub myproc: u64,
+    pub wakeup: u64,
+    pub cpus: u64,
+    pub kmem: u64,
+    pub kernel_end: u64,
+    pub proc_start: u64,
+    pub proc_end: u64,
+    pub user_exec: Option<u64>,
+}
+
 const XV6_CPU_STRIDE: u64 = 128;
-const XV6_HOLDING: u64 = 0x8000_0b94;
-const XV6_PUSH_OFF: u64 = 0x8000_0bc0;
-const XV6_ACQUIRE: u64 = 0x8000_0c04;
-const XV6_POP_OFF: u64 = 0x8000_0c44;
-const XV6_RELEASE: u64 = 0x8000_0c94;
-const XV6_MEMCMP: u64 = 0x8000_0cf2;
-const XV6_MEMMOVE: u64 = 0x8000_0d2c;
-const XV6_STRNCMP: u64 = 0x8000_0da0;
-const XV6_STRNCPY: u64 = 0x8000_0dda;
-const XV6_STRLEN: u64 = 0x8000_0e56;
-const XV6_UVMUNMAP: u64 = 0x8000_1202;
-const XV6_FREEWALK: u64 = 0x8000_137a;
-const XV6_UVMCOPY: u64 = 0x8000_1408;
-const XV6_MYPROC: u64 = 0x8000_1902;
-const XV6_WAKEUP: u64 = 0x8000_1f5e;
-const XV6_KMEM: u64 = 0x8000_f938;
 const XV6_KMEM_FREELIST: u64 = 24;
-const XV6_END: u64 = 0x8002_0b68;
-const XV6_PROC: u64 = 0x8000_fd88;
-const XV6_PROC_END: u64 = 0x8001_5788;
 const XV6_PROC_STRIDE: u64 = 360;
 const XV6_PROC_STATE: u64 = 24;
 const XV6_PROC_CHAN: u64 = 32;
 const XV6_PROC_SLEEPING: u32 = 2;
 const XV6_PROC_RUNNABLE: u32 = 3;
-const XV6_USER_EXEC: u64 = 0x505c;
 const XV6_PGSIZE: u64 = 4096;
 const XV6_MAXVA: u64 = 1 << 38;
 const XV6_PTE_V: u64 = 1 << 0;
@@ -75,6 +104,7 @@ const XV6_PTE_W: u64 = 1 << 2;
 const XV6_PTE_X: u64 = 1 << 3;
 const TIMER_CYCLES_PER_STEP: u64 = 10;
 
+/// 一次虚拟地址访问的用途，用于选择页权限和页错误类型。
 #[derive(Copy, Clone)]
 pub enum MemoryAccess {
     Fetch,
@@ -83,10 +113,12 @@ pub enum MemoryAccess {
 }
 
 impl Cpu {
+    /// 使用默认复位向量和 DRAM 末端栈指针创建 CPU。
     pub fn new(bus: Box<dyn MemDevice>) -> Self {
         Self::with_reset_vector(bus, crate::cfg::CPU_START_ADDR, crate::cfg::DRAM_END)
     }
 
+    /// 使用调用方给定的复位向量和初始栈指针创建 CPU。
     pub fn with_reset_vector(bus: Box<dyn MemDevice>, reset_vector: u64, initial_sp: u64) -> Self {
         let mut cpu = Cpu {
             registers: [0; 32],
@@ -96,11 +128,13 @@ impl Cpu {
             cycles: 0,
             reset_vector,
             initial_sp,
+            xv6_accelerator: None,
         };
         cpu.registers[2] = initial_sp;
         cpu
     }
 
+    /// 恢复构造时的寄存器、PC、CSR 和周期状态，同时保留总线及可选加速器配置。
     pub fn reset(&mut self) {
         self.registers = [0; 32];
         self.registers[2] = self.initial_sp;
@@ -109,7 +143,21 @@ impl Cpu {
         self.cycles = 0;
     }
 
+    /// 启用与当前 xv6 镜像匹配的快速路径。
+    pub fn set_xv6_accelerator(&mut self, accelerator: Xv6Accelerator) {
+        self.xv6_accelerator = Some(accelerator);
+    }
+
+    /// 关闭 xv6 快速路径，使所有地址都按普通指令执行。
+    pub fn clear_xv6_accelerator(&mut self) {
+        self.xv6_accelerator = None;
+    }
+
+    /// 推进一个 CPU 步骤。
+    ///
+    /// 中断或快速路径被接管时也算一个成功步骤；未被 guest trap 接管的异常才返回 `Err`。
     pub fn step(&mut self) -> Result<(), Exception> {
+        // 先推进时间，使本步开始时即可观察到刚到期的定时器中断。
         self.tick();
         if self.take_pending_interrupt() {
             return Ok(());
@@ -120,6 +168,7 @@ impl Cpu {
         let instruction = match self.fetch() {
             Ok(instruction) => instruction,
             Err(e) => {
+                // 取指失败与执行异常走同一 trap 入口；没有 STVEC 时再上报宿主。
                 if self.trap_exception(e) {
                     return Ok(());
                 }
@@ -131,6 +180,7 @@ impl Cpu {
         Ok(())
     }
 
+    /// 重复调用 [`Cpu::step`]，直到步数耗尽或出现未处理异常。
     pub fn run(&mut self, options: RunOptions) -> RunOutcome {
         let mut steps = 0;
         loop {
@@ -160,18 +210,23 @@ impl Cpu {
         }
     }
 
-    // read a 32 bits instruction from memory and increment the pc
+    /// 翻译当前 PC，并从物理总线读取一个 32 位取指窗口。
+    ///
+    /// 压缩指令只使用低 16 位；统一读取 4 字节可让译码入口保持单一格式。
     fn fetch(&mut self) -> Result<u64, Exception> {
         let addr = self.translate(self.pc, MemoryAccess::Fetch)?;
         self.bus.read(addr, 4)
     }
-    // execute the instruction and return the new pc address
+    /// 译码并执行一条指令，返回提交后的 PC。
     fn execute(&mut self, instruction: u64) -> Result<u64, Exception> {
         let old_pc = self.pc;
         let inst = instruction as u32;
         let decoded = instruction::decode(inst);
         match instruction::execute(self, decoded) {
             Ok(_) => {
+                // 当前以“PC 是否变化”推断执行器有没有提交控制流或压缩指令。
+                // 因此合法的零偏移 branch/jump 会被误判为普通 32 位指令并额外前进 4；
+                // 后续应让执行器返回结构化 next-PC，而不是继续扩展这一启发式规则。
                 if self.pc == old_pc {
                     Ok(self.pc.wrapping_add(4))
                 } else {
@@ -179,6 +234,7 @@ impl Cpu {
                 }
             }
             Err(e) => {
+                // 异常必须以故障指令 PC 作为 SEPC，因此先撤销执行器可能留下的 PC 变化。
                 self.pc = old_pc;
                 if self.trap_exception(e) {
                     return Ok(self.pc);
@@ -192,6 +248,7 @@ impl Cpu {
         let Some((scause, stval)) = exception_trap_info(exception) else {
             return false;
         };
+        // STVEC 为零表示 guest 尚未安装监督模式入口，此时把异常交还调用方。
         if self.csr.load(csr::STVEC) == 0 {
             return false;
         }
@@ -199,16 +256,21 @@ impl Cpu {
         true
     }
 
+    /// 输出当前 PC。
     pub fn dump_pc(&mut self) {
         println!("pc: {:#x}", self.pc);
     }
 
+    /// 输出全部整数寄存器。
     pub fn dump_registers(&mut self) {
         for (i, &value) in self.registers.iter().enumerate() {
             println!("x{:02}: {:#018x}", i, value);
         }
     }
 
+    /// 根据当前 `SATP` 把虚拟地址翻译为物理地址，并检查访问类型对应的页权限。
+    ///
+    /// `satp.mode=0` 直接返回原地址，mode 8 使用三级 Sv39 页表；其他模式在当前模型中返回页错误。
     pub fn translate(&mut self, addr: u64, access: MemoryAccess) -> Result<u64, Exception> {
         let satp = self.csr.load(csr::SATP);
         let mode = satp >> 60;
@@ -219,11 +281,13 @@ impl Cpu {
             return Err(page_fault(access, addr));
         }
 
+        // Sv39 每级索引 9 位，最低 12 位保留为页内偏移。
         let vpn = [
             (addr >> 12) & 0x1ff,
             (addr >> 21) & 0x1ff,
             (addr >> 30) & 0x1ff,
         ];
+        // SATP 的低 44 位是根页表物理页号，恢复物理地址时补回 12 个零位。
         let mut table = (satp & ((1u64 << 44) - 1)) << 12;
 
         for level in (0..=2).rev() {
@@ -234,11 +298,13 @@ impl Cpu {
             let writable = pte & 0x4 != 0;
             let executable = pte & 0x8 != 0;
             let user = pte & 0x10 != 0;
+            // RISC-V 将 W=1、R=0 视为保留的非法叶子组合。
             if !valid || (writable && !readable) {
                 return Err(page_fault(access, addr));
             }
 
             if readable || executable {
+                // 当前模型用 PC 是否落在 DRAM 以下近似用户态；用户访问不能落到 U=0 的页。
                 if self.pc < crate::cfg::DRAM_BASE && !user {
                     return Err(page_fault(access, addr));
                 }
@@ -254,6 +320,7 @@ impl Cpu {
                 let page_bits = 12 + 9 * level;
                 let page_mask = (1u64 << page_bits) - 1;
                 let ppn = (pte >> 10) & ((1u64 << 44) - 1);
+                // 叶子可出现在任意层；低位来自虚拟地址，因而同时覆盖普通页和大页。
                 return Ok(((ppn << 12) & !page_mask) | (addr & page_mask));
             }
 
@@ -263,6 +330,7 @@ impl Cpu {
         Err(page_fault(access, addr))
     }
 
+    /// 保存监督模式 trap 状态并跳转到 `STVEC` 的直接入口。
     pub fn enter_supervisor_trap(&mut self, scause: u64, stval: u64) {
         let mut sstatus = self.csr.load(csr::SSTATUS);
         let was_sie = sstatus & csr::MASK_SIE != 0;
@@ -271,6 +339,7 @@ impl Cpu {
         } else {
             sstatus &= !csr::MASK_SPP;
         }
+        // SIE 被压入 SPIE，随后关闭全局监督模式中断，供 sret 对称恢复。
         if was_sie {
             sstatus |= csr::MASK_SPIE;
         } else {
@@ -282,9 +351,11 @@ impl Cpu {
         self.csr.store(csr::SEPC, self.pc);
         self.csr.store(csr::SCAUSE, scause);
         self.csr.store(csr::STVAL, stval);
+        // 当前实现只进入直接基址，清除 STVEC 低两位的模式编码。
         self.pc = self.csr.load(csr::STVEC) & !0x3;
     }
 
+    /// 按当前简化的 `sret` 规则恢复中断状态并返回 `SEPC`。
     pub fn supervisor_return(&mut self) {
         let mut sstatus = self.csr.load(csr::SSTATUS);
         if sstatus & csr::MASK_SPIE != 0 {
@@ -299,10 +370,12 @@ impl Cpu {
     }
 
     fn take_pending_interrupt(&mut self) -> bool {
+        // 全局 SIE 关闭时，单独的定时器/外部中断使能位不能触发 trap。
         if self.csr.load(csr::SSTATUS) & csr::MASK_SIE == 0 {
             return false;
         }
 
+        // 先检查定时器，固定当前单 hart 模型中多个中断同时到达时的优先顺序。
         if self.timer_is_pending() && self.csr.load(csr::SIE) & csr::MASK_STIP != 0 {
             self.enter_supervisor_trap((1 << 63) | 5, 0);
             return true;
@@ -330,24 +403,28 @@ impl Cpu {
     }
 
     fn try_xv6_fast_path(&mut self) -> Result<bool, Exception> {
+        let Some(accelerator) = self.xv6_accelerator else {
+            return Ok(false);
+        };
+        // 仅匹配已从当前 ELF 解析出的函数入口，避免在普通指令中间误触发。
         match self.pc {
-            XV6_MYCPU => self.fast_xv6_mycpu(),
-            XV6_HOLDING => self.fast_xv6_holding(),
-            XV6_PUSH_OFF => self.fast_xv6_push_off(),
-            XV6_ACQUIRE => self.fast_xv6_acquire(),
-            XV6_POP_OFF => self.fast_xv6_pop_off(),
-            XV6_RELEASE => self.fast_xv6_release(),
-            XV6_MEMCMP => self.fast_xv6_memcmp(),
-            XV6_MEMMOVE => self.fast_xv6_memmove(),
-            XV6_STRNCMP => self.fast_xv6_strncmp(),
-            XV6_STRNCPY => self.fast_xv6_strncpy(),
-            XV6_STRLEN => self.fast_xv6_strlen(),
-            XV6_UVMUNMAP => self.fast_xv6_uvmunmap(),
-            XV6_FREEWALK => self.fast_xv6_freewalk(),
-            XV6_UVMCOPY => self.fast_xv6_uvmcopy(),
-            XV6_MYPROC => self.fast_xv6_myproc(),
-            XV6_WAKEUP => self.fast_xv6_wakeup(),
-            XV6_USER_EXEC => self.fast_xv6_user_exec(),
+            pc if pc == accelerator.mycpu => self.fast_xv6_mycpu(),
+            pc if pc == accelerator.holding => self.fast_xv6_holding(),
+            pc if pc == accelerator.push_off => self.fast_xv6_push_off(),
+            pc if pc == accelerator.acquire => self.fast_xv6_acquire(),
+            pc if pc == accelerator.pop_off => self.fast_xv6_pop_off(),
+            pc if pc == accelerator.release => self.fast_xv6_release(),
+            pc if pc == accelerator.memcmp => self.fast_xv6_memcmp(),
+            pc if pc == accelerator.memmove => self.fast_xv6_memmove(),
+            pc if pc == accelerator.strncmp => self.fast_xv6_strncmp(),
+            pc if pc == accelerator.strncpy => self.fast_xv6_strncpy(),
+            pc if pc == accelerator.strlen => self.fast_xv6_strlen(),
+            pc if pc == accelerator.uvmunmap => self.fast_xv6_uvmunmap(),
+            pc if pc == accelerator.freewalk => self.fast_xv6_freewalk(),
+            pc if pc == accelerator.uvmcopy => self.fast_xv6_uvmcopy(),
+            pc if pc == accelerator.myproc => self.fast_xv6_myproc(),
+            pc if pc == accelerator.wakeup => self.fast_xv6_wakeup(),
+            pc if accelerator.user_exec == Some(pc) => self.fast_xv6_user_exec(),
             _ => Ok(false),
         }
     }
@@ -380,6 +457,7 @@ impl Cpu {
 
         let cpu = self.xv6_cpu_addr();
         let noff = self.read_u32(cpu + 120)?;
+        // 只在最外层关中断时保存原 SIE；嵌套层退出不能覆盖最初状态。
         if noff == 0 {
             self.write_u32(cpu + 124, old_sie)?;
         }
@@ -466,6 +544,7 @@ impl Cpu {
         let dst = self.registers[10];
         let src = self.registers[11];
         let len = self.registers[12] as u32 as usize;
+        // 先完整读取再写回，保证源、目标区间重叠时仍符合 memmove 语义。
         let mut bytes = Vec::with_capacity(len);
         for i in 0..len {
             bytes.push(self.read_u8(src + i as u64)?);
@@ -558,6 +637,7 @@ impl Cpu {
         let npages = self.registers[12];
         let do_free = self.registers[13] != 0;
 
+        // xv6 页表操作要求起始虚拟地址页对齐；不满足时退回真实 guest 实现处理。
         if va & (XV6_PGSIZE - 1) != 0 {
             return Ok(false);
         }
@@ -653,6 +733,7 @@ impl Cpu {
             if pte & 0x1 == 0 {
                 continue;
             }
+            // freewalk 只释放中间页表；遇到叶子映射说明调用前置条件不成立。
             if pte & (XV6_PTE_R | XV6_PTE_W | XV6_PTE_X) != 0 {
                 return Ok(false);
             }
@@ -670,7 +751,8 @@ impl Cpu {
     }
 
     fn xv6_kfree_page(&mut self, page: u64) -> Result<bool, Exception> {
-        if page & 0xfff != 0 || !(XV6_END..crate::cfg::DRAM_END).contains(&page) {
+        let accelerator = self.xv6_accelerator.expect("xv6 accelerator is configured");
+        if page & 0xfff != 0 || !(accelerator.kernel_end..crate::cfg::DRAM_END).contains(&page) {
             return Ok(false);
         }
 
@@ -678,7 +760,7 @@ impl Cpu {
             self.write_phys_u64(page + offset, 0x0101_0101_0101_0101)?;
         }
 
-        let freelist = XV6_KMEM + XV6_KMEM_FREELIST;
+        let freelist = accelerator.kmem + XV6_KMEM_FREELIST;
         let old_head = self.read_phys_u64(freelist)?;
         self.write_phys_u64(page, old_head)?;
         self.write_phys_u64(freelist, page)?;
@@ -686,7 +768,8 @@ impl Cpu {
     }
 
     fn xv6_kalloc_page(&mut self) -> Result<Option<u64>, Exception> {
-        let freelist = XV6_KMEM + XV6_KMEM_FREELIST;
+        let accelerator = self.xv6_accelerator.expect("xv6 accelerator is configured");
+        let freelist = accelerator.kmem + XV6_KMEM_FREELIST;
         let page = self.read_phys_u64(freelist)?;
         if page == 0 {
             return Ok(None);
@@ -767,15 +850,17 @@ impl Cpu {
     }
 
     fn write_phys_u64(&mut self, addr: u64, value: u64) -> Result<(), Exception> {
+        // 总线写接口只接收 u32，物理 64 位值按小端低字在前拆分。
         self.bus.write(addr, value as u32, 4)?;
         self.bus.write(addr + 4, (value >> 32) as u32, 4)
     }
 
     fn fast_xv6_wakeup(&mut self) -> Result<bool, Exception> {
+        let accelerator = self.xv6_accelerator.expect("xv6 accelerator is configured");
         let chan = self.registers[10];
         let current = self.read_u64(self.xv6_cpu_addr())?;
-        let mut proc = XV6_PROC;
-        while proc < XV6_PROC_END {
+        let mut proc = accelerator.proc_start;
+        while proc < accelerator.proc_end {
             if proc != current
                 && self.read_u32(proc + XV6_PROC_STATE)? == XV6_PROC_SLEEPING
                 && self.read_u64(proc + XV6_PROC_CHAN)? == chan
@@ -790,6 +875,7 @@ impl Cpu {
     }
 
     fn fast_xv6_user_exec(&mut self) -> Result<bool, Exception> {
+        // 该兼容路径只针对用户地址空间；内核同地址值不能被当作用户函数入口。
         if self.pc >= crate::cfg::DRAM_BASE {
             return Ok(false);
         }
@@ -819,8 +905,9 @@ impl Cpu {
     }
 
     fn xv6_cpu_addr(&self) -> u64 {
+        let accelerator = self.xv6_accelerator.expect("xv6 accelerator is configured");
         let hart = self.registers[4] as i32 as i64 as u64;
-        XV6_CPUS + hart.wrapping_mul(XV6_CPU_STRIDE)
+        accelerator.cpus + hart.wrapping_mul(XV6_CPU_STRIDE)
     }
 
     fn read_u8(&mut self, addr: u64) -> Result<u8, Exception> {
@@ -868,14 +955,17 @@ fn xv6_px(level: u64, va: u64) -> u64 {
 }
 
 fn xv6_pte_to_pa(pte: u64) -> u64 {
+    // xv6 PTE 的物理页号从 bit10 开始，恢复地址时重新补上 12 位页内零偏移。
     ((pte >> 10) & ((1u64 << 44) - 1)) << 12
 }
 
 fn xv6_pa_to_pte(pa: u64) -> u64 {
+    // 物理地址必须按页编码；先移除页内偏移，再放到 PTE 的 PPN 位段。
     (pa >> 12) << 10
 }
 
 fn exception_trap_info(exception: Exception) -> Option<(u64, u64)> {
+    // 在一个位置维护 Exception 到监督模式 scause/stval 的映射，避免各执行路径自行编码。
     let info = match exception {
         Exception::InstructionAddrMisaligned(addr) => (0, addr),
         Exception::InstructionAccessFault(addr) => (1, addr),

@@ -21,6 +21,7 @@ need perl
 need "${TOOLPREFIX}gcc"
 need "${TOOLPREFIX}objcopy"
 need "${TOOLPREFIX}readelf"
+need "${TOOLPREFIX}nm"
 
 if ((${#missing[@]} > 0)); then
   printf 'Missing tools:\n' >&2
