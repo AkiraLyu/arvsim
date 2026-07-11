@@ -1,8 +1,15 @@
+//! RV64 指令执行和测试 UART 的短路径集成测试。
+//!
+//! 汇编片段由外部 RISC-V 工具链编译为 flat binary，再通过与 xv6 相同的测试机器接口执行。
+
 mod support;
 
 use arvsim::bus::MemDevice;
 use arvsim::cfg;
+use arvsim::trap::Exception;
 use std::error::Error;
+
+const RV64I_SIGNATURE_ADDR: u64 = cfg::DRAM_BASE + 0x1000;
 
 #[test]
 fn compiled_addi_smoke_runs_one_step() -> Result<(), Box<dyn Error>> {
@@ -37,7 +44,6 @@ fn testbench_uart_model_captures_16550_transmit_bytes() {
 }
 
 #[test]
-#[ignore = "future ISA contract: requires correct load/store immediates, branches, jumps, and x0 hard-wiring"]
 fn rv64i_memory_branch_and_x0_contract() -> Result<(), Box<dyn Error>> {
     let bin = support::build_flat_asm(
         "rv64i-contract",
@@ -54,15 +60,36 @@ _start:
         jal  x0, pass
 fail:
         addi x31, x0, 1
+        jal  x0, done
 pass:
         addi x31, x0, 42
+done:
+        li   t2, 0x80001000
+        sd   x31, 0(t2)
+        ebreak
 "#,
     )?;
 
     let mut machine = support::TestMachine::with_flat_binary(bin, cfg::DRAM_SIZE)?;
-    machine.run_steps(9).unwrap();
+    let mut halted = false;
+    for _ in 0..32 {
+        match machine.cpu.step() {
+            Ok(()) => {}
+            Err(Exception::Breakpoint(_)) => {
+                halted = true;
+                break;
+            }
+            Err(error) => return Err(format!("unexpected CPU exception: {error:?}").into()),
+        }
+    }
 
+    assert!(halted, "guest did not reach its explicit ebreak halt");
+    let signature = machine
+        .cpu
+        .bus
+        .read(RV64I_SIGNATURE_ADDR, 8)
+        .map_err(|error| format!("failed to read guest signature: {error:?}"))?;
     assert_eq!(machine.cpu.registers[0], 0);
-    assert_eq!(machine.cpu.registers[31], 42);
+    assert_eq!(signature, 42);
     Ok(())
 }

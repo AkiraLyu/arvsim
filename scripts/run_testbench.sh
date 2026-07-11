@@ -14,7 +14,6 @@ case "${1:-}" in
     ;;
   --future-contracts)
     cargo test
-    cargo test --test rv64i_smoke -- --ignored
     cargo test --test xv6_fixture -- --ignored
     ;;
   --xv6-contracts)
@@ -29,9 +28,9 @@ Usage:
   scripts/run_testbench.sh --future-contracts
   scripts/run_testbench.sh --xv6-contracts
 
-The future-contract tests are expected to fail until the simulator implements
-the ISA and device behavior required by xv6. The xv6 contracts cover booting
-to a shell, running user programs, quick usertests, and the full usertests suite.
+The opt-in xv6 contracts require an external fixture and long execution budgets.
+They cover booting to a shell, running user programs, quick usertests, and the
+full usertests suite; a failure is a regression or an unmet behavior contract.
 EOF
     exit 2
     ;;
