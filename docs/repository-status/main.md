@@ -2,11 +2,11 @@
 
 ## 功能与实现思路
 
-命令行入口负责解析运行参数、创建可配置 DRAM、装载 flat/ELF 镜像、按平台选择挂载 UART、创建 CPU，并通过统一的 `Cpu::run(RunOptions)` 执行。参数解析不依赖第三方 crate，错误通过 `ExitCode` 显式返回。
+命令行入口负责解析运行参数、创建 `Platform`、装载 flat/ELF 镜像、按预设选择挂载 UART，再构建 `Machine` 并执行。参数解析不依赖第三方 crate，错误通过 `ExitCode` 显式返回。
 
 ## 当前状态
 
-已完成原优化清单：
+当前提供：
 
 - 正确跳过 `argv[0]`，将唯一位置参数作为 guest 镜像路径。
 - 支持 `-h/--help`、未知参数检查、缺值检查和重复镜像检查。
@@ -42,13 +42,14 @@ Options:
 ## 耦合方式
 
 - 依赖 `loader` 完成格式检测和镜像装载。
-- 依赖 `Dram::with_layout` 和 `Cpu::with_reset_vector` 应用运行时布局。
-- 通过统一 `Bus::attach_device` 挂载 DRAM/UART，不再硬编码第二份 UART 地址。
+- 通过 `Platform` 应用 DRAM 布局、检查 MMIO 冲突并挂载 UART。
+- 通过 `Machine` facade 启动 CPU；当前时钟和总线中断查询仍在 CPU 内部完成。
 - `bare` 和 `uart` 仍是轻量平台，不包含 CLINT、PLIC 或 virtio；xv6 完整平台仍只存在测试支撑中。
 
 ## 剩余边界
 
 - 没有 guest 主动 halt/exit 协议；目前正常停止点是步数上限，未被 trap 处理的 guest 异常返回失败。
 - 参数解析使用 UTF-8 `std::env::args()`，不支持非 UTF-8 镜像路径。
-- 平台配置只覆盖 DRAM/UART，尚未升级为可复用的正式 `MachineConfig`。
+- CLI 平台预设仍只覆盖 DRAM/UART；更完整的设备组合可通过库级 `Platform::attach_device` 扩展。
 - 超大 DRAM 配置可能因宿主分配失败而由分配器终止，未提供稀疏内存或可恢复 OOM。
+- `--dram-base` 虽能改变物理布局，但 CPU privilege 启发式和部分指令/xv6 加速仍引用默认 `cfg` 常量，复杂 guest 的自定义布局并非完全一致。

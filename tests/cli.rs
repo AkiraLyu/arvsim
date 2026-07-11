@@ -1,3 +1,7 @@
+//! 命令行进程级回归测试。
+//!
+//! 这些测试启动 Cargo 构建出的真实 `arvsim` 可执行文件，验证退出码和用户可见输出，而不是复用内部解析函数。
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;

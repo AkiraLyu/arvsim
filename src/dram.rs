@@ -1,15 +1,22 @@
+//! 连续、按小端解释的 DRAM 设备。
+//!
+//! [`Dram`] 用字节向量保存物理内存。镜像装载负责边界检查，普通总线访问则把越界映射成 RISC-V 访问错误。
+
 use crate::{bus::MemDevice, trap::Exception};
 
+/// 一段从 `base` 开始的连续物理内存。
 pub struct Dram {
     pub dram: Vec<u8>,
     pub base: u64,
 }
 
 impl Dram {
+    /// 使用 [`crate::cfg`] 中的默认基址和容量创建清零内存。
     pub fn new() -> Self {
         Self::with_layout(crate::cfg::DRAM_BASE, crate::cfg::DRAM_SIZE)
     }
 
+    /// 使用指定布局创建清零内存。
     pub fn with_layout(base: u64, size: usize) -> Self {
         Dram {
             dram: vec![0; size],
@@ -17,10 +24,12 @@ impl Dram {
         }
     }
 
+    /// 返回半开地址区间的末端；地址加法溢出时返回 `None`。
     pub fn end(&self) -> Option<u64> {
         self.base.checked_add(self.dram.len() as u64)
     }
 
+    /// 将字节复制到指定物理地址，要求整个范围都位于 DRAM 内。
     pub fn load_bytes(&mut self, addr: u64, bytes: &[u8]) -> Result<(), std::io::Error> {
         let offset = addr
             .checked_sub(self.base)
@@ -34,6 +43,7 @@ impl Dram {
         Ok(())
     }
 
+    /// 清零指定物理范围，主要用于 ELF 中 `memsz` 大于 `filesz` 的部分。
     pub fn zero_range(&mut self, addr: u64, len: usize) -> Result<(), std::io::Error> {
         let offset = addr
             .checked_sub(self.base)
@@ -47,6 +57,7 @@ impl Dram {
         Ok(())
     }
 
+    /// 将 flat binary 装载到 DRAM 基址。
     pub fn load(&mut self, filename: &str) -> Result<(), std::io::Error> {
         use std::fs::File;
         use std::io::Read;
@@ -71,6 +82,7 @@ impl MemDevice for Dram {
 
         let mut val = 0u64;
         for i in 0..size {
+            // 低地址字节放到整数低位，保持 guest 可见的小端顺序。
             val |= (self.dram[offset + i] as u64) << (i * 8);
         }
         Ok(val)
@@ -86,6 +98,7 @@ impl MemDevice for Dram {
         }
 
         for i in 0..size {
+            // 每次只取对应字节，避免宿主端字节序影响模拟结果。
             self.dram[offset + i] = ((value >> (i * 8)) & 0xff) as u8;
         }
         Ok(())
@@ -106,30 +119,22 @@ mod tests {
     fn test_dram_read_write() {
         let mut dram = Dram::new();
 
-        // Write 4 bytes
         assert!(dram.write(dram.base, 0x12345678, 4).is_ok());
-        // Read back the 4 bytes
         let val = dram.read(dram.base, 4).unwrap();
         assert_eq!(val, 0x12345678);
 
-        // Write 2 bytes
         assert!(dram.write(dram.base + 4, 0x9abc, 2).is_ok());
-        // Read back the 2 bytes
         let val = dram.read(dram.base + 4, 2).unwrap();
         assert_eq!(val, 0x9abc);
 
-        // Write 1 byte
         assert!(dram.write(dram.base + 6, 0xde, 1).is_ok());
-        // Read back the 1 byte
         let val = dram.read(dram.base + 6, 1).unwrap();
         assert_eq!(val, 0xde);
 
-        // Test out of bounds read
         assert!(
             dram.read(dram.base + crate::cfg::DRAM_SIZE as u64, 4)
                 .is_err()
         );
-        // Test out of bounds write
         assert!(
             dram.write(dram.base + crate::cfg::DRAM_SIZE as u64, 0x1234, 2)
                 .is_err()

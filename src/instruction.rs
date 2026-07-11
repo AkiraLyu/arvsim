@@ -1,3 +1,9 @@
+//! RISC-V 指令字段译码和执行。
+//!
+//! 模块先把 32 位取指窗口拆成 [`Instruction`] 的公共字段，再按 opcode 分派执行。
+//! 低两位不是 `0b11` 时改走 16 位压缩指令路径。执行器直接更新 [`Cpu`] 的寄存器、PC、CSR 和总线状态，
+//! 并在每条指令结束时恢复零号寄存器约束。
+
 use crate::{
     cfg,
     cpu::{Cpu, MemoryAccess},
@@ -5,6 +11,9 @@ use crate::{
     trap::Exception,
 };
 
+/// 从 32 位取指窗口提取出的通用指令字段。
+///
+/// `raw` 必须保留原始编码，因为立即数和部分子操作需要跨字段重新拼接位段。
 pub struct Instruction {
     pub opcode: u8,
     pub rd: u8,
@@ -15,6 +24,7 @@ pub struct Instruction {
     pub raw: u32,
 }
 
+/// 提取 opcode、寄存器编号和功能字段，不在这一阶段判断组合是否合法。
 pub fn decode(instruction: u32) -> Instruction {
     let opcode = (instruction & 0x7f) as u8;
     let rd = ((instruction >> 7) & 0x1f) as u8;
@@ -34,7 +44,11 @@ pub fn decode(instruction: u32) -> Instruction {
     }
 }
 
+/// 执行一条已译码指令。
+///
+/// 32 位和压缩指令共享此入口；不支持的编码返回 [`Exception::IllegalInstruction`]。
 pub fn execute(cpu: &mut Cpu, inst: Instruction) -> Result<(), Exception> {
+    // RISC-V 以低两位区分 16 位压缩编码与普通 32 位编码。
     if inst.raw & 0b11 != 0b11 {
         return execute_compressed(cpu, inst.raw as u16);
     }
@@ -67,10 +81,12 @@ pub fn execute(cpu: &mut Cpu, inst: Instruction) -> Result<(), Exception> {
 }
 
 fn execute_load(cpu: &mut Cpu, inst: &Instruction) -> Result<(), Exception> {
+    // 有效地址先按 XLEN 环绕相加，再由 MMU 决定物理地址和读取权限。
     let addr = cpu.translate(
         reg(cpu, inst.rs1).wrapping_add(imm_i(inst.raw)),
         MemoryAccess::Load,
     )?;
+    // 当前执行器不额外拒绝未对齐地址；翻译后访问会原样交给总线设备。
     let value = match inst.funct3 {
         0x0 => sign_extend(cpu.bus.read(addr, 1)?, 8),
         0x1 => sign_extend(cpu.bus.read(addr, 2)?, 16),
@@ -90,6 +106,7 @@ fn execute_store(cpu: &mut Cpu, inst: &Instruction) -> Result<(), Exception> {
         reg(cpu, inst.rs1).wrapping_add(imm_s(inst.raw)),
         MemoryAccess::Store,
     )?;
+    // 与 load 相同，当前路径不单独实施对齐检查，设备访问结果决定是否成功。
     let value = reg(cpu, inst.rs2);
     match inst.funct3 {
         0x0 => write_mem(cpu, addr, value, 1),
@@ -194,6 +211,7 @@ fn execute_branch(cpu: &mut Cpu, inst: &Instruction) -> Result<(), Exception> {
 }
 
 fn execute_jal(cpu: &mut Cpu, inst: &Instruction) -> Result<(), Exception> {
+    // 链接地址始终指向当前 32 位指令之后，目标地址则相对当前 PC 计算。
     let link = cpu.pc.wrapping_add(4);
     let target = cpu.pc.wrapping_add(imm_j(inst.raw));
     write_reg(cpu, inst.rd, link);
@@ -206,6 +224,7 @@ fn execute_jalr(cpu: &mut Cpu, inst: &Instruction) -> Result<(), Exception> {
         return Err(Exception::IllegalInstruction(inst.raw as u64));
     }
     let link = cpu.pc.wrapping_add(4);
+    // JALR 规定目标最低位清零；这不是通用的地址对齐修正。
     let target = reg(cpu, inst.rs1).wrapping_add(imm_i(inst.raw)) & !1;
     write_reg(cpu, inst.rd, link);
     cpu.pc = target;
@@ -240,6 +259,7 @@ fn execute_system(cpu: &mut Cpu, inst: &Instruction) -> Result<(), Exception> {
     let rs1_value = reg(cpu, inst.rs1);
     let uimm = inst.rs1 as u64;
 
+    // CSR 指令必须先取得旧值供 rd 使用，再按 funct3 选择写、置位或清位。
     match inst.funct3 {
         0x1 => {
             if inst.rd != 0 {
@@ -295,6 +315,7 @@ fn execute_amo(cpu: &mut Cpu, inst: &Instruction) -> Result<(), Exception> {
         _ => return Err(Exception::IllegalInstruction(inst.raw as u64)),
     };
     let funct5 = (inst.raw >> 27) & 0x1f;
+    // 返回 rd 的 AMO.W 旧值需要符号扩展，而参与无符号运算时仍保留原始位型。
     let old_raw = cpu.bus.read(addr, width)?;
     let old = if width == 4 {
         sign_extend(old_raw, 32)
@@ -305,7 +326,7 @@ fn execute_amo(cpu: &mut Cpu, inst: &Instruction) -> Result<(), Exception> {
 
     let (result, store) = match funct5 {
         0x02 => (old, None),      // LR.W/LR.D
-        0x03 => (0, Some(rhs)),   // SC.W/SC.D, succeeds in this single-hart model.
+        0x03 => (0, Some(rhs)),   // 当前单 hart 模型不跟踪 reservation，SC 固定成功。
         0x01 => (old, Some(rhs)), // AMOSWAP
         0x00 => (old, Some(old_raw.wrapping_add(rhs))),
         0x04 => (old, Some(old_raw ^ rhs)),
@@ -569,9 +590,7 @@ fn execute_mul_div(lhs: u64, rhs: u64, funct3: u8) -> u64 {
         0x2 => (((lhs as i64 as i128) * (rhs as u128 as i128)) >> 64) as u64,
         0x3 => (((lhs as u128) * (rhs as u128)) >> 64) as u64,
         0x4 => div_signed(lhs, rhs),
-        0x5 => {
-            lhs.checked_div(rhs).unwrap_or(u64::MAX)
-        }
+        0x5 => lhs.checked_div(rhs).unwrap_or(u64::MAX),
         0x6 => rem_signed(lhs, rhs),
         0x7 => {
             if rhs == 0 {
@@ -675,26 +694,19 @@ fn amo_max(lhs: u64, rhs: u64, width: usize) -> u64 {
 
 fn amo_minu(lhs: u64, rhs: u64, width: usize) -> u64 {
     let mask = width_mask(width);
-    if lhs & mask < rhs & mask {
-        lhs
-    } else {
-        rhs
-    }
+    if lhs & mask < rhs & mask { lhs } else { rhs }
 }
 
 fn amo_maxu(lhs: u64, rhs: u64, width: usize) -> u64 {
     let mask = width_mask(width);
-    if lhs & mask > rhs & mask {
-        lhs
-    } else {
-        rhs
-    }
+    if lhs & mask > rhs & mask { lhs } else { rhs }
 }
 
 fn write_mem(cpu: &mut Cpu, addr: u64, value: u64, size: usize) -> Result<(), Exception> {
     match size {
         1 | 2 | 4 => cpu.bus.write(addr, value as u32, size),
         8 => {
+            // MemDevice::write 只接收 u32，64 位存储必须按小端拆成低、高两个 32 位访问。
             cpu.bus.write(addr, value as u32, 4)?;
             cpu.bus.write(addr.wrapping_add(4), (value >> 32) as u32, 4)
         }
@@ -703,8 +715,8 @@ fn write_mem(cpu: &mut Cpu, addr: u64, value: u64, size: usize) -> Result<(), Ex
 }
 
 fn try_accelerate_memset_loop(cpu: &mut Cpu, inst: &Instruction) -> Result<bool, Exception> {
-    // xv6 clears and poisons RAM with a byte-store memset loop; batch only that
-    // exact DRAM-local pattern so the default xv6 step budget reaches device init.
+    // xv6 会用逐字节循环清零或填毒内存；这里只批处理精确匹配且完全位于 DRAM 的循环，
+    // 既缩短启动步数，又避免把相似但带 MMIO 副作用的循环错误合并。
     if inst.funct3 != 0x1 || imm_b(inst.raw) != u64::MAX - 5 {
         return Ok(false);
     }
@@ -762,6 +774,7 @@ fn fill_dram_bytes(cpu: &mut Cpu, start: u64, end: u64, byte: u8) -> Result<(), 
 }
 
 fn finish(cpu: &mut Cpu, result: Result<(), Exception>) -> Result<(), Exception> {
+    // 即使执行路径误写了 x0，指令边界也必须恢复架构规定的常零值。
     cpu.registers[0] = 0;
     result
 }
@@ -771,12 +784,14 @@ fn reg(cpu: &Cpu, reg: u8) -> u64 {
 }
 
 fn write_reg(cpu: &mut Cpu, reg: u8, value: u64) {
+    // 在写入口同时屏蔽 x0，可避免大多数路径短暂破坏零号寄存器。
     if reg != 0 {
         cpu.registers[reg as usize] = value;
     }
 }
 
 fn advance_compressed_pc(cpu: &mut Cpu) {
+    // 压缩指令自行前进 2 字节，CPU 外层看到 PC 已变化后不会再追加 4。
     cpu.pc = cpu.pc.wrapping_add(2);
 }
 
@@ -801,6 +816,7 @@ fn width_mask(width: usize) -> u64 {
 }
 
 fn sign_extend(value: u64, bits: u32) -> u64 {
+    // 先把源符号位移到 bit63，再做算术右移；结果保持 RV64 的二进制补码位型。
     ((value << (64 - bits)) as i64 >> (64 - bits)) as u64
 }
 
@@ -813,10 +829,12 @@ fn imm_i(raw: u32) -> u64 {
 }
 
 fn imm_s(raw: u32) -> u64 {
+    // S 型立即数被 rs2 两侧字段分开存放，拼接后再按 12 位符号扩展。
     sign_extend((((raw >> 25) << 5) | ((raw >> 7) & 0x1f)) as u64, 12)
 }
 
 fn imm_b(raw: u32) -> u64 {
+    // 分支偏移最低位恒为零，编码中的高低位需要按规范位置重新排列。
     let imm = ((raw >> 31) << 12)
         | (((raw >> 7) & 0x1) << 11)
         | (((raw >> 25) & 0x3f) << 5)
@@ -825,10 +843,12 @@ fn imm_b(raw: u32) -> u64 {
 }
 
 fn imm_u(raw: u32) -> u64 {
+    // RV64 的 U 型结果先形成 32 位值，再从 bit31 符号扩展到 XLEN。
     sign_extend((raw & 0xffff_f000) as u64, 32)
 }
 
 fn imm_j(raw: u32) -> u64 {
+    // J 型偏移同样隐含最低零位，其余位在指令中并非连续排列。
     let imm = ((raw >> 31) << 20)
         | (((raw >> 12) & 0xff) << 12)
         | (((raw >> 20) & 0x1) << 11)
@@ -865,10 +885,8 @@ fn c_rs2_prime(raw: u16) -> u8 {
 }
 
 fn c_imm6(raw: u16) -> u64 {
-    sign_extend(
-        ((raw as u64 >> 7) & 0x20) | ((raw as u64 >> 2) & 0x1f),
-        6,
-    )
+    // 压缩立即数的符号位位于 bit12，其余五位位于 bit6:2。
+    sign_extend(((raw as u64 >> 7) & 0x20) | ((raw as u64 >> 2) & 0x1f), 6)
 }
 
 fn c_shamt(raw: u16) -> u32 {
@@ -876,6 +894,7 @@ fn c_shamt(raw: u16) -> u32 {
 }
 
 fn c_addi16sp_imm(raw: u16) -> u64 {
+    // C.ADDI16SP 的非连续位段隐含低四位为零，因此拼接后按 10 位数符号扩展。
     let imm = ((raw as u64 >> 3) & 0x200)
         | ((raw as u64 >> 2) & 0x10)
         | (((raw as u64) << 1) & 0x40)
@@ -885,6 +904,7 @@ fn c_addi16sp_imm(raw: u16) -> u64 {
 }
 
 fn c_j_imm(raw: u16) -> u64 {
+    // 压缩跳转偏移的位序经过重排，最低位同样由指令格式隐含为零。
     let imm = ((raw as u64 >> 1) & 0x800)
         | ((raw as u64 >> 7) & 0x10)
         | ((raw as u64 >> 1) & 0x300)
@@ -897,6 +917,7 @@ fn c_j_imm(raw: u16) -> u64 {
 }
 
 fn c_b_imm(raw: u16) -> u64 {
+    // 压缩分支使用 9 位有符号偏移；掩码同时完成位段搬移和最低零位保留。
     let imm = ((raw as u64 >> 4) & 0x100)
         | (((raw as u64) << 1) & 0xc0)
         | (((raw as u64) << 3) & 0x20)

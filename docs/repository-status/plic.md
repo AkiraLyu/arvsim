@@ -2,7 +2,7 @@
 
 ## 功能与当前状态
 
-文件为空，仅保留公开模块路径，正式库没有 PLIC 类型或 MMIO 寄存器实现，状态为占位。
+实现为空，仅有模块级说明和公开模块路径；正式库没有 PLIC 类型或 MMIO 寄存器实现，状态为占位。
 
 ## 对外接口
 
@@ -10,7 +10,7 @@
 
 ## 耦合方式
 
-正式 `Bus` 可以轮询任意 `MemDevice::pending_interrupt`，但 CLI 未挂载 PLIC。唯一可工作的简化 PLIC 位于 `tests/support/mod.rs`，只仲裁 UART IRQ 10。
+正式 `Bus` 可以轮询任意 `MemDevice::pending_interrupt`，但 CLI 未挂载 PLIC。唯一可工作的简化 PLIC 位于 `tests/support/mod.rs`，只仲裁 UART IRQ 10；virtio 虽会设置自身 interrupt status，却没有连接到该 PLIC pending 位。
 
 ## 优化方向
 

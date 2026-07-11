@@ -1,3 +1,8 @@
+//! guest 镜像装载器。
+//!
+//! 支持把 flat binary 放到 DRAM 基址，或解析小端 RISC-V ELF64 的 `PT_LOAD` 段。
+//! 装载器只负责把字节放入已创建的 DRAM，并返回入口地址；CPU 和平台组装由调用方完成。
+
 use crate::dram::Dram;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -12,23 +17,34 @@ const ELFDATA2LSB: u8 = 1;
 const EM_RISCV: u16 = 243;
 const PT_LOAD: u32 = 1;
 
+/// 调用方要求或自动检测的镜像格式。
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ImageFormat {
+    /// 根据 ELF magic 选择 ELF，否则按 flat binary 处理。
     Auto,
+    /// 无头部、从 DRAM 基址开始放置的原始字节流。
     Flat,
+    /// 小端 RISC-V ELF64。
     Elf,
 }
 
+/// 成功装载后供 CPU 初始化使用的元数据。
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct LoadedImage {
+    /// 实际采用的格式；不会是 [`ImageFormat::Auto`]。
     pub format: ImageFormat,
+    /// guest 的初始 PC。
     pub entry: u64,
+    /// flat 文件长度或所有可装载 ELF 段的内存尺寸之和。
     pub loaded_bytes: u64,
 }
 
+/// 读取文件或验证镜像布局时产生的错误。
 #[derive(Debug)]
 pub enum LoadError {
+    /// 宿主文件或 DRAM 范围操作失败。
     Io(std::io::Error),
+    /// 镜像头、段表或入口不符合当前装载器约束。
     InvalidImage(String),
 }
 
@@ -56,6 +72,7 @@ impl From<std::io::Error> for LoadError {
     }
 }
 
+/// 从文件读取并装载镜像。
 pub fn load_image<P: AsRef<Path>>(
     dram: &mut Dram,
     path: P,
@@ -65,6 +82,7 @@ pub fn load_image<P: AsRef<Path>>(
     load_image_bytes(dram, &bytes, format)
 }
 
+/// 从内存字节装载镜像，便于调用方复用已读取的数据或编写测试。
 pub fn load_image_bytes(
     dram: &mut Dram,
     bytes: &[u8],
@@ -91,6 +109,7 @@ pub fn load_image_bytes(
 }
 
 fn load_elf64(dram: &mut Dram, bytes: &[u8]) -> Result<LoadedImage, LoadError> {
+    // 在读取定长字段前先确认 ELF64 基本头完整，后续偏移读取仍各自检查边界。
     if bytes.len() < ELF64_HEADER_SIZE || !bytes.starts_with(ELF_MAGIC) {
         return invalid("not an ELF image");
     }
@@ -146,6 +165,7 @@ fn load_elf64(dram: &mut Dram, bytes: &[u8]) -> Result<LoadedImage, LoadError> {
             .filter(|end| *end <= bytes.len())
             .ok_or_else(|| LoadError::InvalidImage("ELF load segment is truncated".into()))?;
         let address = if physical_address == 0 {
+            // 部分裸机 ELF 不填写 p_paddr，此时以虚拟地址作为实际装载地址。
             virtual_address
         } else {
             physical_address
@@ -153,6 +173,7 @@ fn load_elf64(dram: &mut Dram, bytes: &[u8]) -> Result<LoadedImage, LoadError> {
 
         dram.load_bytes(address, &bytes[file_offset..file_end])?;
         if memory_size > file_size {
+            // 文件未携带的尾部对应 BSS，必须显式清零以得到 ELF 约定的初始状态。
             let bss_address = address
                 .checked_add(file_size as u64)
                 .ok_or_else(|| LoadError::InvalidImage("ELF segment address overflow".into()))?;

@@ -1,10 +1,17 @@
+//! 最小化 UART 输出设备。
+//!
+//! 该模型只提供当前命令行运行所需的发送路径和固定状态：接收缓冲始终为空，
+//! 发送保持就绪，写 THR 会立即输出到宿主标准输出。测试平台使用另一套可注入输入的 UART 模型。
+
 use crate::{bus::MemDevice, trap::Exception};
 
+/// 以 `base` 为 MMIO 起点的简化 UART。
 pub struct Uart {
     pub base: u64,
 }
 
 impl Uart {
+    /// 创建 UART；调用方必须将同一基址用于总线映射。
     pub fn new(base: u64) -> Self {
         Uart { base }
     }
@@ -34,7 +41,9 @@ impl MemDevice for Uart {
                 let ch = (value & 0xff) as u8;
                 print!("{}", ch as char);
                 use std::io::Write;
-                std::io::stdout().flush().map_err(|_| Exception::StoreAMOAccessFault(addr))?;
+                std::io::stdout()
+                    .flush()
+                    .map_err(|_| Exception::StoreAMOAccessFault(addr))?;
                 Ok(())
             }
             _ => Err(Exception::IllegalInstruction(addr)),
@@ -81,4 +90,3 @@ mod tests {
         assert!(result.is_ok());
     }
 }
-

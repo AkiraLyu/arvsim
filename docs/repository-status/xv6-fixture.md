@@ -8,7 +8,7 @@
 
 - fixture 完整性检查默认执行；如果构件不存在会直接打印提示并返回成功，因此默认通过不证明 fixture 可构建或 xv6 可运行。
 - 启动、基础命令、quick usertests、full usertests 共 4 个合同全部 `#[ignore]`。
-- ignore 文案仍写“future contract”，与仓库历史文档中曾声称可通过的状态不一致；本轮没有重新执行这些长测试，因此当前结论应是“存在实现与合同，未纳入默认回归”。
+- ignore 原因明确标注它们是依赖外部 fixture 和长预算的 opt-in 合同。本轮没有重新执行长测试，因此当前结论是“存在合同，未由本轮复核行为结果”。
 
 ## 对外接口
 
@@ -22,5 +22,6 @@
 
 - fixture 缺失时测试“绿色跳过”而不是 Cargo ignored/明确 skip，可能造成错误安全感。
 - 默认 CI 不执行任何 xv6 行为合同，快速路径或设备回归可能长期未发现。
+- 构建脚本会记录实际 commit，但测试不读取 `fixture.env`、不校验 commit/构件哈希，也没有把固定结构偏移与 fixture 版本绑定。
 - 以自由文本匹配判断状态易受上游输出变化影响。
 - 建议增加短时 boot smoke 到定期 CI，长测放 nightly；固定 xv6 commit 并记录 fixture 哈希；区分 skip/pass；为关键阶段提供结构化退出/signature。

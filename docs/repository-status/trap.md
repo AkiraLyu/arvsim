@@ -21,4 +21,5 @@
 - 没有实现 `Display`/`Error`，调用方只能使用调试格式。
 - `IllegalInstruction` 同时被 UART 用来表示未知寄存器，语义污染。
 - 中断以裸 `u64 scause` 从总线返回，未与异常建模统一。
+- `ecall` 执行路径不构造这里已有的 U/S/M variant，而是直接进入固定 supervisor trap；枚举与实际执行语义已经分叉。
 - 建议拆分 `Exception`、`Interrupt`、`Trap`，集中维护 cause 编码和 trap value，并为设备访问错误使用 access fault 或独立设备错误。

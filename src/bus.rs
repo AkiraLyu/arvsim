@@ -1,18 +1,32 @@
+//! 内存映射设备接口和物理总线。
+//!
+//! [`Bus`] 维护互不重叠的半开地址区间，并把 CPU 的物理读写转发给覆盖完整访问范围的设备。
+//! 地址未命中时在总线边界统一产生访问错误，设备仍负责解释自己的寄存器偏移和访问宽度。
+
 use crate::trap::Exception;
 use std::collections::BTreeMap;
 
+/// CPU 与 RAM、MMIO 设备之间的最小访问协议。
+///
+/// 地址是总线物理地址而不是设备内偏移。`write` 的数据宽度受现有接口约束为 `u32`；
+/// 需要写入 64 位值的上层必须拆成两次 32 位访问。
 pub trait MemDevice {
+    /// 从 `addr` 开始读取 `size` 个字节，并以小端整数返回。
     fn read(&mut self, addr: u64, size: usize) -> Result<u64, Exception>;
+    /// 向 `addr` 开始的 `size` 个字节写入 `value` 的低位部分。
     fn write(&mut self, addr: u64, value: u32, size: usize) -> Result<(), Exception>;
+    /// 返回一个待处理的中断原因；默认设备不产生中断。
     fn pending_interrupt(&mut self) -> Option<u64> {
         None
     }
 }
 
+/// 按物理地址分发访问的设备总线。
 pub struct Bus {
     devices: BTreeMap<u64, DeviceRegion>,
 }
 
+/// 一个已挂载设备及其半开地址区间 `[base, base + size)`。
 pub struct DeviceRegion {
     pub base: u64,
     pub size: u64,
@@ -20,20 +34,24 @@ pub struct DeviceRegion {
 }
 
 impl Bus {
+    /// 创建一条尚未挂载任何设备的总线。
     pub fn new() -> Self {
         Bus {
             devices: BTreeMap::new(),
         }
     }
 
+    /// 按默认 DRAM 容量挂载 RAM 的便捷入口。
     pub fn attach_ram(&mut self, base: u64, dev: Box<dyn MemDevice>) {
         self.attach_device(base, crate::cfg::DRAM_SIZE as u64, dev);
     }
 
+    /// 按当前 UART 窗口大小挂载设备的便捷入口。
     pub fn attach_uart(&mut self, base: u64, dev: Box<dyn MemDevice>) {
         self.attach_device(base, 0x100, dev);
     }
 
+    /// 挂载一个设备，并拒绝零长度、地址溢出或区间重叠。
     pub fn attach_device(&mut self, base: u64, size: u64, dev: Box<dyn MemDevice>) {
         assert!(size > 0, "device region size must be non-zero");
         let end = base.checked_add(size).expect("device region end overflow");
@@ -54,6 +72,7 @@ impl Bus {
 
     fn find_dev(&mut self, addr: u64, size: usize) -> Option<&mut Box<dyn MemDevice>> {
         let size = u64::try_from(size).ok()?;
+        // 先找不大于起始地址的最后一个区域，再验证“整个访问”都没有越过区域末端。
         let (_, region) = self.devices.range_mut(..=addr).next_back()?;
         let end = addr.checked_add(size)?;
         let region_end = region.base.checked_add(region.size)?;
@@ -118,13 +137,11 @@ mod tests {
         let mut bus = Bus::new();
         bus.attach_ram(base, Box::new(dram));
 
-        // read
         for i in 0..size {
             let val = bus.read(base + i as u64, 1).unwrap();
             assert_eq!(val, i as u64);
         }
 
-        // write
         for i in 0..size {
             bus.write(base + i as u64, (i + 1) as u32, 1).unwrap();
         }

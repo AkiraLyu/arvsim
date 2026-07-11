@@ -2,38 +2,46 @@
 
 ## 本轮执行结果
 
-执行日期：2026-07-10。分析基线：提交 `2f64e7a` 加当前工作树中的 CLI、loader、CPU/DRAM API、测试和文档变更。
+执行日期：2026-07-11。分析基线：提交 `008ae8b` 加当前未提交工作树；验证命令针对实际工作树执行。
 
-### `cargo test`
+### 默认与静态检查
 
-结果：通过。
+`cargo test --all-targets` 通过：
 
-- 库单元测试：15 passed。
-- `src/main.rs`：4 passed。
+- 库单元测试：20 passed。
+- `src/main.rs`：3 passed。
 - `tests/cli.rs`：3 passed。
-- `tests/rv64i_smoke.rs`：2 passed，1 ignored。
+- `tests/rv64i_smoke.rs`：3 passed。
 - `tests/xv6_fixture.rs`：1 passed，4 ignored。
-- doc tests：0 tests。
+- 合计 30 passed、4 ignored、0 failed。
 
-完成 CLI 优化后默认回归一共实际执行 25 个测试：库 15 个、CLI 单元 4 个、CLI 进程集成 3 个、RV64 集成 2 个、fixture 检查 1 个；另有 5 个测试被忽略。新增覆盖包括 flat/ELF 装载、BSS 清零、参数解析、区域重叠、真实进程退出码、`Cpu::run()` 步数限制和可配置复位/CSR 清理。仍未覆盖 CPU trap/MMU/interrupt、正式 UART 输入、CLINT/PLIC 或 xv6 行为合同。
+其他检查：
 
-`cargo clippy --lib --bin arvsim -- -D warnings` 通过。`cargo clippy --all-targets -- -D warnings` 仍被既有 `tests/support/mod.rs` 的两个 lint 阻断（单元素循环和可改为范围的 OR pattern），与本次 CLI 改动无关。
+- `cargo test --doc`：通过，当前 0 个 doc test。
+- `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps`：通过。
+- `cargo fmt --all -- --check`：通过。
+- `cargo clippy --lib --bin arvsim -- -D warnings`：通过。
+- `cargo clippy --all-targets -- -D warnings`：通过。
+- `bash -n scripts/build_xv6_fixture.sh scripts/run_testbench.sh scripts/run_xv6_cli.sh`：通过。
+- `git diff --check`：通过。
+- `docs/**/*.md` 相对链接与空文件检查：通过；原有两个空白占位文档已移除，索引不再指向空页面。
 
-### `cargo test --test rv64i_smoke -- --ignored`
+默认回归覆盖 flat/ELF 装载、BSS 清零、参数解析、平台区域冲突、真实 CLI 退出码、CPU 运行限制/reset、CSR 别名、基础指令合同和测试 UART。它没有覆盖完整特权状态机、关键 trap/MMU/interrupt 语义、正式 UART 输入、CLINT/PLIC 或 xv6 行为合同。
 
-结果：失败。
+### 已有 xv6 回归记录（本轮未复核）
 
-`rv64i_memory_branch_and_x0_contract` 在第 9 步以 `IllegalInstruction(0)` 失败。汇编的成功控制流只执行 8 条指令，故该结果首先暴露的是测试步数/终止协议问题，不能据此断言 load/store/branch/jump 语义失败。
+2026-07-10 曾针对 fixture commit `1982fd12595f52a0e5ef8db466257a01fb1fbfef` 验证动态解析 `Xv6Accelerator` 符号后的启动与基础 shell 合同：`run_xv6_cli.sh --boot-only` 到达 shell，启动测试与 `echo/ls/cat README` 合同通过。这些结果说明当时的 fixture 可用，但不作为 2026-07-11 当前工作树的重新执行证据。
 
 ### 未执行项
 
-未运行 `cargo test --test xv6_fixture -- --ignored`：四个测试需要外部 fixture，最长预算为 20 亿步，不适合作为本轮文档核验的即时命令。仓库历史文档曾记录通过结果，但当前默认测试不能复核该结论。
+未运行 `cargo test --test xv6_fixture -- --ignored`：四个测试需要外部 fixture，最长预算为 20 亿步，不适合作为本轮状态扫描的即时命令。默认执行的 fixture 完整性测试在构件缺失时会返回成功，因此其他环境中的绿色默认测试不能证明 xv6 fixture 存在。
 
 ## 覆盖缺口
 
 - CLI 已有参数单元测试和 3 个真实进程测试，但 ELF、调试输出、UART 平台与 guest exception 进程路径尚未覆盖。
-- CPU 新增运行循环和 reset 单元测试；关键特权、trap、MMU 和中断语义仍主要依赖默认关闭的 xv6 黑盒测试。
-- Bus 只测基本区域末端，没有重叠、溢出、零尺寸和中断顺序测试。
+- CPU 有运行循环和 reset 单元测试；零偏移控制流、关键特权、trap、MMU 和中断语义没有精确回归。
+- Bus 只测基本读写与区域末端；重叠/溢出通过 `Platform` 间接覆盖，零宽/非法宽度、中断顺序和直接 `Bus::attach_device` panic 合同未覆盖。
 - 指令测试仅有解码和立即数小测试，大部分执行语义没有精确回归。
-- 测试 PLIC/virtio 没有独立设备测试。
-- 没有自动化 clippy/格式、Miri、fuzz、riscv-arch-test 或覆盖率门槛的仓库配置。
+- `Machine` 测试证明转发和组装可用，但不覆盖设备 tick/reset；测试 helper 仍直接调用 CPU。
+- 测试 PLIC/virtio 没有独立设备测试，畸形访问或 descriptor 可导致 panic/错误类型混用。
+- 格式和 clippy 当前手工通过，但仓库没有 CI gate，也没有 Miri、fuzz、riscv-arch-test 或覆盖率门槛。

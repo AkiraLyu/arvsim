@@ -23,5 +23,7 @@
 ## 剩余边界
 
 - 只处理 ELF64 little-endian RISC-V 的 `PT_LOAD`，不解析 section、symbol、relocation、动态链接或设备树。
-- 不检查 ELF 类型、segment flags、对齐约束和相互覆盖。
+- 不检查 ELF 类型、segment flags、对齐约束和相互覆盖；入口只要求位于 DRAM，不要求落在已装载且可执行的 segment。
+- 装载不是事务性的：前一个 segment 写入后若后续 segment 非法，调用方收到错误时 DRAM 已部分修改；CLI 会丢弃该平台，但库调用方需要自行处理。
+- segment/flat 越界由 `Dram` 以 `std::io::Error` 返回，最终归入 `LoadError::Io`；这会把 guest 布局错误与宿主文件 I/O 错误混在同一分类。
 - flat binary 不携带入口，默认使用 DRAM 基址，调用方可通过 CLI `--entry` 覆盖。

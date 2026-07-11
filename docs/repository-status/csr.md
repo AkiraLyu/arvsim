@@ -20,8 +20,8 @@ CPU 持有并直接更新 `Csr`；指令模块执行 CSR 指令时直接调用 `
 
 ## 已知问题与优化方向
 
-- `store(SIP)` 保留未委托位时读取的是 `MIE` 而不是 `MIP`，会把中断使能状态混入 pending 状态，疑似实现错误。
 - 所有 CSR 均可读写，不检查当前特权级、只读编码、WARL/WPRI 或未实现 CSR。
-- `Cpu::reset()` 不重置 CSR，复位后可能保留旧的页表和 trap 状态。
-- `SSTATUS` 掩码和 SIE/SIP 别名只是子集；计时器和 counter 语义也未规范化。
-- 建议由 CSR 层接收当前 privilege 和访问类型，返回非法指令错误；为每个实现 CSR 定义读写掩码和副作用，并补齐复位测试。
+- `load/store` 是接受任意 `usize` 的公开 API，地址超过 4095 会直接越界 panic；指令路径虽只产生 12 位地址，下游直接调用没有保护。
+- `SSTATUS` 掩码和 SIE/SIP 别名只是子集；`MIDELEG/MIP/MIE` 也缺少规范写掩码。硬件 pending 位与软件存储没有区分，设备或 guest 可互相覆盖状态。
+- supervisor timer pending 由 CPU 临时比较而不是写入 `MIP/SIP.STIP`，读 CSR 观察不到 CPU 即将交付的 timer interrupt；counter/Sstc 权限也未实现。
+- 建议由 CSR 层接收当前 privilege 和访问类型，返回非法指令错误；为每个实现 CSR 定义读写掩码、硬件 pending 输入和副作用，并增加非法地址、只读位和 timer 可见性测试。
