@@ -6,8 +6,8 @@
 
 use crate::{
     cfg,
-    cpu::{Cpu, MemoryAccess},
-    csr::MEPC,
+    cpu::{Cpu, MemoryAccess, PrivilegeMode},
+    csr,
     trap::Exception,
 };
 
@@ -81,20 +81,25 @@ pub fn execute(cpu: &mut Cpu, inst: Instruction) -> Result<(), Exception> {
 }
 
 fn execute_load(cpu: &mut Cpu, inst: &Instruction) -> Result<(), Exception> {
+    let size = match inst.funct3 {
+        0x0 | 0x4 => 1,
+        0x1 | 0x5 => 2,
+        0x2 | 0x6 => 4,
+        0x3 => 8,
+        _ => return Err(Exception::IllegalInstruction(inst.raw as u64)),
+    };
     // 有效地址先按 XLEN 环绕相加，再由 MMU 决定物理地址和读取权限。
-    let addr = cpu.translate(
-        reg(cpu, inst.rs1).wrapping_add(imm_i(inst.raw)),
-        MemoryAccess::Load,
-    )?;
+    let virtual_addr = reg(cpu, inst.rs1).wrapping_add(imm_i(inst.raw));
+    let addr = cpu.translate_sized(virtual_addr, MemoryAccess::Load, size)?;
     // 当前执行器不额外拒绝未对齐地址；翻译后访问会原样交给总线设备。
     let value = match inst.funct3 {
-        0x0 => sign_extend(cpu.bus.read(addr, 1)?, 8),
-        0x1 => sign_extend(cpu.bus.read(addr, 2)?, 16),
-        0x2 => sign_extend(cpu.bus.read(addr, 4)?, 32),
-        0x3 => cpu.bus.read(addr, 8)?,
-        0x4 => cpu.bus.read(addr, 1)?,
-        0x5 => cpu.bus.read(addr, 2)?,
-        0x6 => cpu.bus.read(addr, 4)?,
+        0x0 => sign_extend(read_load(cpu, addr, virtual_addr, 1)?, 8),
+        0x1 => sign_extend(read_load(cpu, addr, virtual_addr, 2)?, 16),
+        0x2 => sign_extend(read_load(cpu, addr, virtual_addr, 4)?, 32),
+        0x3 => read_load(cpu, addr, virtual_addr, 8)?,
+        0x4 => read_load(cpu, addr, virtual_addr, 1)?,
+        0x5 => read_load(cpu, addr, virtual_addr, 2)?,
+        0x6 => read_load(cpu, addr, virtual_addr, 4)?,
         _ => return Err(Exception::IllegalInstruction(inst.raw as u64)),
     };
     write_reg(cpu, inst.rd, value);
@@ -102,17 +107,22 @@ fn execute_load(cpu: &mut Cpu, inst: &Instruction) -> Result<(), Exception> {
 }
 
 fn execute_store(cpu: &mut Cpu, inst: &Instruction) -> Result<(), Exception> {
-    let addr = cpu.translate(
-        reg(cpu, inst.rs1).wrapping_add(imm_s(inst.raw)),
-        MemoryAccess::Store,
-    )?;
+    let size = match inst.funct3 {
+        0x0 => 1,
+        0x1 => 2,
+        0x2 => 4,
+        0x3 => 8,
+        _ => return Err(Exception::IllegalInstruction(inst.raw as u64)),
+    };
+    let virtual_addr = reg(cpu, inst.rs1).wrapping_add(imm_s(inst.raw));
+    let addr = cpu.translate_sized(virtual_addr, MemoryAccess::Store, size)?;
     // 与 load 相同，当前路径不单独实施对齐检查，设备访问结果决定是否成功。
     let value = reg(cpu, inst.rs2);
     match inst.funct3 {
-        0x0 => write_mem(cpu, addr, value, 1),
-        0x1 => write_mem(cpu, addr, value, 2),
-        0x2 => write_mem(cpu, addr, value, 4),
-        0x3 => write_mem(cpu, addr, value, 8),
+        0x0 => write_mem(cpu, addr, virtual_addr, value, 1),
+        0x1 => write_mem(cpu, addr, virtual_addr, value, 2),
+        0x2 => write_mem(cpu, addr, virtual_addr, value, 4),
+        0x3 => write_mem(cpu, addr, virtual_addr, value, 8),
         _ => Err(Exception::IllegalInstruction(inst.raw as u64)),
     }
 }
@@ -205,7 +215,7 @@ fn execute_branch(cpu: &mut Cpu, inst: &Instruction) -> Result<(), Exception> {
         if try_accelerate_memset_loop(cpu, inst)? {
             return Ok(());
         }
-        cpu.pc = cpu.pc.wrapping_add(imm_b(inst.raw));
+        cpu.write_pc(cpu.pc.wrapping_add(imm_b(inst.raw)));
     }
     Ok(())
 }
@@ -215,7 +225,7 @@ fn execute_jal(cpu: &mut Cpu, inst: &Instruction) -> Result<(), Exception> {
     let link = cpu.pc.wrapping_add(4);
     let target = cpu.pc.wrapping_add(imm_j(inst.raw));
     write_reg(cpu, inst.rd, link);
-    cpu.pc = target;
+    cpu.write_pc(target);
     Ok(())
 }
 
@@ -227,96 +237,120 @@ fn execute_jalr(cpu: &mut Cpu, inst: &Instruction) -> Result<(), Exception> {
     // JALR 规定目标最低位清零；这不是通用的地址对齐修正。
     let target = reg(cpu, inst.rs1).wrapping_add(imm_i(inst.raw)) & !1;
     write_reg(cpu, inst.rd, link);
-    cpu.pc = target;
+    cpu.write_pc(target);
     Ok(())
 }
 
 fn execute_system(cpu: &mut Cpu, inst: &Instruction) -> Result<(), Exception> {
     match inst.raw {
         0x0000_0073 => {
-            cpu.enter_supervisor_trap(8, 0);
-            return Ok(());
+            return Err(match cpu.privilege {
+                PrivilegeMode::User => Exception::EnvironmentCallFromUMode(cpu.pc),
+                PrivilegeMode::Supervisor => Exception::EnvironmentCallFromSMode(cpu.pc),
+                PrivilegeMode::Machine => Exception::EnvironmentCallFromMMode(cpu.pc),
+            });
         }
         0x0010_0073 => return Err(Exception::Breakpoint(cpu.pc)),
         0x1020_0073 => {
+            let illegal = cpu.privilege == PrivilegeMode::User
+                || (cpu.privilege == PrivilegeMode::Supervisor
+                    && cpu.csr.load(csr::MSTATUS) & csr::MASK_TSR != 0);
+            if illegal {
+                return Err(Exception::IllegalInstruction(inst.raw as u64));
+            }
             cpu.supervisor_return();
             return Ok(());
         }
-        0x1050_0073 => return Ok(()), // WFI
+        0x1050_0073 => {
+            let illegal = cpu.privilege == PrivilegeMode::User
+                || (cpu.privilege == PrivilegeMode::Supervisor
+                    && cpu.csr.load(csr::MSTATUS) & csr::MASK_TW != 0);
+            return if illegal {
+                Err(Exception::IllegalInstruction(inst.raw as u64))
+            } else {
+                Ok(())
+            };
+        }
         0x3020_0073 => {
-            cpu.pc = cpu.csr.load(MEPC);
+            if cpu.privilege != PrivilegeMode::Machine {
+                return Err(Exception::IllegalInstruction(inst.raw as u64));
+            }
+            cpu.machine_return();
             return Ok(());
         }
         _ => {}
     }
 
     if inst.raw & 0xfe00_7fff == 0x1200_0073 {
-        return Ok(()); // SFENCE.VMA
+        let illegal = cpu.privilege == PrivilegeMode::User
+            || (cpu.privilege == PrivilegeMode::Supervisor
+                && cpu.csr.load(csr::MSTATUS) & csr::MASK_TVM != 0);
+        return if illegal {
+            Err(Exception::IllegalInstruction(inst.raw as u64))
+        } else {
+            Ok(())
+        };
     }
 
     let csr_addr = ((inst.raw >> 20) & 0x0fff) as usize;
-    let old = cpu.csr.load(csr_addr);
     let rs1_value = reg(cpu, inst.rs1);
     let uimm = inst.rs1 as u64;
-
-    // CSR 指令必须先取得旧值供 rd 使用，再按 funct3 选择写、置位或清位。
-    match inst.funct3 {
-        0x1 => {
-            if inst.rd != 0 {
-                write_reg(cpu, inst.rd, old);
-            }
-            cpu.csr.store(csr_addr, rs1_value);
-            Ok(())
-        }
-        0x2 => {
-            write_reg(cpu, inst.rd, old);
-            if inst.rs1 != 0 {
-                cpu.csr.store(csr_addr, old | rs1_value);
-            }
-            Ok(())
-        }
-        0x3 => {
-            write_reg(cpu, inst.rd, old);
-            if inst.rs1 != 0 {
-                cpu.csr.store(csr_addr, old & !rs1_value);
-            }
-            Ok(())
-        }
-        0x5 => {
-            if inst.rd != 0 {
-                write_reg(cpu, inst.rd, old);
-            }
-            cpu.csr.store(csr_addr, uimm);
-            Ok(())
-        }
-        0x6 => {
-            write_reg(cpu, inst.rd, old);
-            if uimm != 0 {
-                cpu.csr.store(csr_addr, old | uimm);
-            }
-            Ok(())
-        }
-        0x7 => {
-            write_reg(cpu, inst.rd, old);
-            if uimm != 0 {
-                cpu.csr.store(csr_addr, old & !uimm);
-            }
-            Ok(())
-        }
-        _ => Err(Exception::IllegalInstruction(inst.raw as u64)),
+    let writes = match inst.funct3 {
+        0x1 | 0x5 => true,
+        0x2 | 0x3 => inst.rs1 != 0,
+        0x6 | 0x7 => uimm != 0,
+        _ => return Err(Exception::IllegalInstruction(inst.raw as u64)),
+    };
+    if !cpu.csr_access_allowed(csr_addr, writes) {
+        return Err(Exception::IllegalInstruction(inst.raw as u64));
     }
+
+    // CSRRW/CSRRWI 在 rd=x0 时不读取 CSR；其余形式需要旧值作为结果或写入输入。
+    let reads = inst.rd != 0 || !matches!(inst.funct3, 0x1 | 0x5);
+    let old = if reads { cpu.csr.load(csr_addr) } else { 0 };
+    let write_old = if matches!(inst.funct3, 0x2 | 0x3 | 0x6 | 0x7) {
+        cpu.csr.load_for_write(csr_addr)
+    } else {
+        old
+    };
+
+    let value = match inst.funct3 {
+        0x1 => rs1_value,
+        0x2 => write_old | rs1_value,
+        0x3 => write_old & !rs1_value,
+        0x5 => uimm,
+        0x6 => write_old | uimm,
+        0x7 => write_old & !uimm,
+        _ => unreachable!(),
+    };
+    if writes {
+        cpu.csr.store(csr_addr, value);
+    }
+    if inst.rd != 0 {
+        write_reg(cpu, inst.rd, old);
+    }
+    Ok(())
 }
 
 fn execute_amo(cpu: &mut Cpu, inst: &Instruction) -> Result<(), Exception> {
-    let addr = cpu.translate(reg(cpu, inst.rs1), MemoryAccess::Store)?;
     let width = match inst.funct3 {
         0x2 => 4,
         0x3 => 8,
         _ => return Err(Exception::IllegalInstruction(inst.raw as u64)),
     };
     let funct5 = (inst.raw >> 27) & 0x1f;
+    let access = if funct5 == 0x02 {
+        MemoryAccess::Load
+    } else {
+        MemoryAccess::Store
+    };
+    let virtual_addr = reg(cpu, inst.rs1);
+    let addr = cpu.translate_sized(virtual_addr, access, width)?;
     // 返回 rd 的 AMO.W 旧值需要符号扩展，而参与无符号运算时仍保留原始位型。
-    let old_raw = cpu.bus.read(addr, width)?;
+    let old_raw = cpu
+        .bus
+        .read(addr, width)
+        .map_err(|_| access_fault(access, virtual_addr))?;
     let old = if width == 4 {
         sign_extend(old_raw, 32)
     } else {
@@ -340,7 +374,7 @@ fn execute_amo(cpu: &mut Cpu, inst: &Instruction) -> Result<(), Exception> {
     };
 
     if let Some(value) = store {
-        write_mem(cpu, addr, value, width)?;
+        write_mem(cpu, addr, virtual_addr, value, width)?;
     }
     write_reg(cpu, inst.rd, result);
     Ok(())
@@ -432,8 +466,9 @@ fn c_load(
     if rd == 0 {
         return Err(Exception::IllegalInstruction(raw as u64));
     }
-    let addr = cpu.translate(reg(cpu, rs1).wrapping_add(imm), MemoryAccess::Load)?;
-    let value = cpu.bus.read(addr, size)?;
+    let virtual_addr = reg(cpu, rs1).wrapping_add(imm);
+    let addr = cpu.translate_sized(virtual_addr, MemoryAccess::Load, size)?;
+    let value = read_load(cpu, addr, virtual_addr, size)?;
     let value = if sign {
         sign_extend(value, (size * 8) as u32)
     } else {
@@ -452,8 +487,9 @@ fn c_store(
     rs2: u8,
     rs1: u8,
 ) -> Result<(), Exception> {
-    let addr = cpu.translate(reg(cpu, rs1).wrapping_add(imm), MemoryAccess::Store)?;
-    write_mem(cpu, addr, reg(cpu, rs2), size)?;
+    let virtual_addr = reg(cpu, rs1).wrapping_add(imm);
+    let addr = cpu.translate_sized(virtual_addr, MemoryAccess::Store, size)?;
+    write_mem(cpu, addr, virtual_addr, reg(cpu, rs2), size)?;
     advance_compressed_pc(cpu);
     Ok(())
 }
@@ -532,14 +568,14 @@ fn c_misc_alu(cpu: &mut Cpu, raw: u16) -> Result<(), Exception> {
 }
 
 fn c_j(cpu: &mut Cpu, raw: u16) -> Result<(), Exception> {
-    cpu.pc = cpu.pc.wrapping_add(c_j_imm(raw));
+    cpu.write_pc(cpu.pc.wrapping_add(c_j_imm(raw)));
     Ok(())
 }
 
 fn c_branch_zero(cpu: &mut Cpu, raw: u16, branch_on_zero: bool) -> Result<(), Exception> {
     let is_zero = reg(cpu, c_rs1_prime(raw)) == 0;
     if is_zero == branch_on_zero {
-        cpu.pc = cpu.pc.wrapping_add(c_b_imm(raw));
+        cpu.write_pc(cpu.pc.wrapping_add(c_b_imm(raw)));
     } else {
         advance_compressed_pc(cpu);
     }
@@ -559,7 +595,7 @@ fn c_jr_mv_add(cpu: &mut Cpu, raw: u16) -> Result<(), Exception> {
     match ((raw >> 12) & 1, rd, rs2) {
         (0, 0, _) => Err(Exception::IllegalInstruction(raw as u64)),
         (0, _, 0) => {
-            cpu.pc = reg(cpu, rd) & !1;
+            cpu.write_pc(reg(cpu, rd) & !1);
             Ok(())
         }
         (0, _, _) => {
@@ -570,7 +606,7 @@ fn c_jr_mv_add(cpu: &mut Cpu, raw: u16) -> Result<(), Exception> {
         (1, 0, 0) => Err(Exception::Breakpoint(cpu.pc)),
         (1, _, 0) => {
             let link = cpu.pc.wrapping_add(2);
-            cpu.pc = reg(cpu, rd) & !1;
+            cpu.write_pc(reg(cpu, rd) & !1);
             write_reg(cpu, 1, link);
             Ok(())
         }
@@ -702,31 +738,65 @@ fn amo_maxu(lhs: u64, rhs: u64, width: usize) -> u64 {
     if lhs & mask > rhs & mask { lhs } else { rhs }
 }
 
-fn write_mem(cpu: &mut Cpu, addr: u64, value: u64, size: usize) -> Result<(), Exception> {
-    match size {
+fn read_load(cpu: &mut Cpu, addr: u64, virtual_addr: u64, size: usize) -> Result<u64, Exception> {
+    cpu.bus
+        .read(addr, size)
+        .map_err(|_| Exception::LoadAccessFault(virtual_addr))
+}
+
+fn access_fault(access: MemoryAccess, addr: u64) -> Exception {
+    match access {
+        MemoryAccess::Fetch => Exception::InstructionAccessFault(addr),
+        MemoryAccess::Load => Exception::LoadAccessFault(addr),
+        MemoryAccess::Store => Exception::StoreAMOAccessFault(addr),
+    }
+}
+
+fn write_mem(
+    cpu: &mut Cpu,
+    addr: u64,
+    virtual_addr: u64,
+    value: u64,
+    size: usize,
+) -> Result<(), Exception> {
+    let result = match size {
         1 | 2 | 4 => cpu.bus.write(addr, value as u32, size),
         8 => {
             // MemDevice::write 只接收 u32，64 位存储必须按小端拆成低、高两个 32 位访问。
-            cpu.bus.write(addr, value as u32, 4)?;
-            cpu.bus.write(addr.wrapping_add(4), (value >> 32) as u32, 4)
+            cpu.bus
+                .write(addr, value as u32, 4)
+                .and_then(|()| cpu.bus.write(addr.wrapping_add(4), (value >> 32) as u32, 4))
         }
         _ => Err(Exception::StoreAMOAccessFault(addr)),
-    }
+    };
+    result.map_err(|_| Exception::StoreAMOAccessFault(virtual_addr))
 }
 
 fn try_accelerate_memset_loop(cpu: &mut Cpu, inst: &Instruction) -> Result<bool, Exception> {
     // xv6 会用逐字节循环清零或填毒内存；这里只批处理精确匹配且完全位于 DRAM 的循环，
     // 既缩短启动步数，又避免把相似但带 MMIO 副作用的循环错误合并。
-    if inst.funct3 != 0x1 || imm_b(inst.raw) != u64::MAX - 5 {
+    if !cpu.xv6_acceleration_enabled()
+        || cpu.privilege != PrivilegeMode::Supervisor
+        || inst.funct3 != 0x1
+        || imm_b(inst.raw) != u64::MAX - 5
+    {
         return Ok(false);
     }
 
     let target = cpu.pc.wrapping_sub(6);
-    let store_raw = match cpu.bus.read(target, 4) {
+    let store_addr = match cpu.translate_sized(target, MemoryAccess::Fetch, 4) {
+        Ok(addr) => addr,
+        Err(_) => return Ok(false),
+    };
+    let addi_addr = match cpu.translate_sized(target.wrapping_add(4), MemoryAccess::Fetch, 2) {
+        Ok(addr) => addr,
+        Err(_) => return Ok(false),
+    };
+    let store_raw = match cpu.bus.read(store_addr, 4) {
         Ok(raw) => raw as u32,
         Err(_) => return Ok(false),
     };
-    let addi_raw = match cpu.bus.read(target.wrapping_add(4), 2) {
+    let addi_raw = match cpu.bus.read(addi_addr, 2) {
         Ok(raw) => raw as u16,
         Err(_) => return Ok(false),
     };
@@ -747,11 +817,27 @@ fn try_accelerate_memset_loop(cpu: &mut Cpu, inst: &Instruction) -> Result<bool,
     if start >= end || start < cfg::DRAM_BASE || end > cfg::DRAM_END {
         return Ok(false);
     }
+    if !identity_store_range(cpu, start, end) {
+        return Ok(false);
+    }
 
     fill_dram_bytes(cpu, start, end, reg(cpu, store.rs2) as u8)?;
     write_reg(cpu, inst.rs1, end);
-    cpu.pc = cpu.pc.wrapping_add(4);
+    cpu.write_pc(cpu.pc.wrapping_add(4));
     Ok(true)
+}
+
+fn identity_store_range(cpu: &mut Cpu, start: u64, end: u64) -> bool {
+    let mut addr = start;
+    while addr < end {
+        let page_end = (addr | 0xfff).saturating_add(1).min(end);
+        let size = (page_end - addr) as usize;
+        match cpu.translate_sized(addr, MemoryAccess::Store, size) {
+            Ok(physical) if physical == addr => addr = page_end,
+            _ => return false,
+        }
+    }
+    true
 }
 
 fn fill_dram_bytes(cpu: &mut Cpu, start: u64, end: u64, byte: u8) -> Result<(), Exception> {
@@ -759,7 +845,7 @@ fn fill_dram_bytes(cpu: &mut Cpu, start: u64, end: u64, byte: u8) -> Result<(), 
     let pattern = u32::from_le_bytes([byte; 4]);
 
     while addr < end && addr & 0x3 != 0 {
-        write_mem(cpu, addr, byte as u64, 1)?;
+        write_mem(cpu, addr, addr, byte as u64, 1)?;
         addr = addr.wrapping_add(1);
     }
     while addr.wrapping_add(4) <= end {
@@ -767,7 +853,7 @@ fn fill_dram_bytes(cpu: &mut Cpu, start: u64, end: u64, byte: u8) -> Result<(), 
         addr = addr.wrapping_add(4);
     }
     while addr < end {
-        write_mem(cpu, addr, byte as u64, 1)?;
+        write_mem(cpu, addr, addr, byte as u64, 1)?;
         addr = addr.wrapping_add(1);
     }
     Ok(())
@@ -792,7 +878,7 @@ fn write_reg(cpu: &mut Cpu, reg: u8, value: u64) {
 
 fn advance_compressed_pc(cpu: &mut Cpu) {
     // 压缩指令自行前进 2 字节，CPU 外层看到 PC 已变化后不会再追加 4。
-    cpu.pc = cpu.pc.wrapping_add(2);
+    cpu.write_pc(cpu.pc.wrapping_add(2));
 }
 
 fn signed(value: u64) -> i64 {

@@ -5,11 +5,11 @@
 mod support;
 
 use arvsim::bus::MemDevice;
-use arvsim::cfg;
-use arvsim::trap::Exception;
+use arvsim::{cfg, csr};
 use std::error::Error;
 
 const RV64I_SIGNATURE_ADDR: u64 = cfg::DRAM_BASE + 0x1000;
+const RV64I_TRAP_VECTOR: u64 = cfg::DRAM_BASE + 0x2000;
 
 #[test]
 fn compiled_addi_smoke_runs_one_step() -> Result<(), Box<dyn Error>> {
@@ -71,15 +71,16 @@ done:
     )?;
 
     let mut machine = support::TestMachine::with_flat_binary(bin, cfg::DRAM_SIZE)?;
+    machine.cpu.csr.store(csr::MTVEC, RV64I_TRAP_VECTOR);
     let mut halted = false;
     for _ in 0..32 {
-        match machine.cpu.step() {
-            Ok(()) => {}
-            Err(Exception::Breakpoint(_)) => {
-                halted = true;
-                break;
-            }
-            Err(error) => return Err(format!("unexpected CPU exception: {error:?}").into()),
+        machine
+            .cpu
+            .step()
+            .map_err(|error| format!("unexpected CPU exception: {error:?}"))?;
+        if machine.cpu.pc == RV64I_TRAP_VECTOR && machine.cpu.csr.load(csr::MCAUSE) == 3 {
+            halted = true;
+            break;
         }
     }
 

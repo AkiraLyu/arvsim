@@ -1,25 +1,25 @@
 # `tests/rv64i_smoke.rs`：RV64 冒烟测试
 
-## 功能与实现思路
+## 功能与实现
 
-通过外部 RISC-V GCC/objcopy 动态构建 flat binary，验证 CPU 单步执行和一段带明确完成协议的 RV64I 控制流；另直接访问 `TestBus` 验证 UART 输出捕获。
+测试通过外部 RISC-V GCC 和 `objcopy` 生成裸二进制镜像，用来检查 CPU 单步执行和一段可以明确判断结束的 RV64I 程序。另一个测试直接访问 `TestBus`，检查 UART 输出是否被正确记录。
 
-## 当前状态
+## 实现状态
 
 3 个测试全部默认执行并通过：
 
 - `compiled_addi_smoke_runs_one_step` 验证 `addi`、PC +4 和 x31=42。
 - UART 测试写入 `OK` 后检查测试缓冲。
-- `rv64i_memory_branch_and_x0_contract` 验证 x0、栈访存、分支和跳转；guest 把 42 写入 signature 并执行 `ebreak`，宿主最多执行 32 步并要求明确看到断点，不再依赖固定成功步数。
+- `rv64i_memory_branch_and_x0_contract` 检查 x0、栈内存访问、分支和跳转。测试先配置 `MTVEC`，程序把 42 写入结果地址后执行 `ebreak`；宿主最多执行 32 步，并检查 PC 已进入机器模式异常入口且 `MCAUSE=3`。
 
-## 对外接口
+## 公共接口
 
-无产品接口；测试通过 `support::build_flat_asm`、`TestMachine`、`TestBus` 和 `MemDevice` 组合。
+本文件不提供库接口。测试使用 `support::build_flat_asm`、`TestMachine`、`TestBus` 和 `MemDevice`。
 
-## 耦合方式
+## 依赖关系
 
-依赖外部 `riscv64-elf-gcc`/`objcopy`、固定链接地址 `0x8000_0000`、测试支撑和 CPU `step()` 语义。
+依赖外部 `riscv64-elf-gcc`/`objcopy`、固定链接地址 `0x8000_0000`、测试辅助模块和 CPU `step()` 语义。
 
-## 优化方向
+## 改进建议
 
-现有合同仍把多类指令串在同一 guest 中，失败定位不够精确；应为零偏移控制流、每类访存/异常、未对齐和边界立即数增加表驱动测试，并在 CI 显式安装或缓存外部工具链。测试 helper 也应改走 `Machine::step()`，为未来设备时钟保留一致入口。
+当前测试把多类指令放在同一个程序中，失败时不容易定位。零偏移控制流和特权级异常已有库单元测试，但仍应分别覆盖各类内存访问、未对齐地址和立即数边界，并在持续集成中安装或缓存外部工具链。测试辅助代码也应调用 `Machine::step()`，以便以后统一推进设备时钟。

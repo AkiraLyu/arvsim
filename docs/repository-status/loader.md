@@ -1,14 +1,14 @@
 # `src/loader.rs`：镜像装载器
 
-## 功能与实现思路
+## 功能与实现
 
-提供独立于 CLI 的 flat binary 和 ELF64 装载 API。`Auto` 模式按 ELF magic 自动选择格式；flat 镜像复制到 DRAM 基址；ELF 按 `PT_LOAD` program header 把文件内容写入物理地址（`p_paddr=0` 时使用 `p_vaddr`），并清零 `p_memsz-p_filesz` 的 BSS 区域。
+提供独立于命令行程序的裸二进制和 ELF64 镜像装载接口。`Auto` 根据 ELF 文件标识自动识别格式；裸二进制镜像从 DRAM 基址开始复制；ELF 根据 `PT_LOAD` 程序头写入物理地址，当 `p_paddr=0` 时改用 `p_vaddr`，并清零 `p_memsz-p_filesz` 对应的 BSS 区域。
 
-## 当前状态
+## 实现状态
 
-已实现 RV64 所需的 ELF64、小端、RISC-V machine 检查，以及 header/segment 截断、整数溢出、文件尺寸、DRAM 边界、loadable segment 和入口范围检查。没有第三方解析依赖。
+已经检查 ELF64、小端格式和 RISC-V 机器类型，也会检查文件头与程序段是否截断、整数是否溢出、段是否超出文件或 DRAM、是否存在可装载段，以及入口是否位于 DRAM。解析过程不依赖第三方库。
 
-## 对外接口
+## 公共接口
 
 - `ImageFormat::{Auto, Flat, Elf}`。
 - `LoadedImage { format, entry, loaded_bytes }`。
@@ -16,14 +16,14 @@
 - `load_image(&mut Dram, path, format)`。
 - `load_image_bytes(&mut Dram, bytes, format)`。
 
-## 耦合方式
+## 依赖关系
 
-装载器只依赖 `dram::Dram` 和标准库；CLI 使用返回的 entry 初始化 CPU。ELF 装载位置必须落入调用方创建的 DRAM 布局。
+装载器只依赖 `dram::Dram` 和标准库；命令行程序使用返回的入口地址初始化 CPU。ELF 装载位置必须落入调用方创建的 DRAM 区域。
 
-## 剩余边界
+## 已知限制
 
-- 只处理 ELF64 little-endian RISC-V 的 `PT_LOAD`，不解析 section、symbol、relocation、动态链接或设备树。
-- 不检查 ELF 类型、segment flags、对齐约束和相互覆盖；入口只要求位于 DRAM，不要求落在已装载且可执行的 segment。
-- 装载不是事务性的：前一个 segment 写入后若后续 segment 非法，调用方收到错误时 DRAM 已部分修改；CLI 会丢弃该平台，但库调用方需要自行处理。
-- segment/flat 越界由 `Dram` 以 `std::io::Error` 返回，最终归入 `LoadError::Io`；这会把 guest 布局错误与宿主文件 I/O 错误混在同一分类。
-- flat binary 不携带入口，默认使用 DRAM 基址，调用方可通过 CLI `--entry` 覆盖。
+- 只处理小端 RISC-V ELF64 的 `PT_LOAD`，不解析节、符号、重定位、动态链接或设备树。
+- 不检查 ELF 类型、段权限、对齐和段重叠。入口只需位于 DRAM，不要求落在已装载且可执行的段中。
+- 装载过程不是原子的：如果后面的段无效，前面的段已经写入 DRAM。命令行程序会丢弃整个平台，但库调用方需要自行处理部分写入。
+- 段或裸二进制镜像越界时，`Dram` 返回 `std::io::Error`，随后被归入 `LoadError::Io`。这会把镜像布局错误和宿主文件读写错误混在一起。
+- 裸二进制镜像不携带入口地址，默认从 DRAM 基址启动；调用方可通过命令行参数 `--entry` 覆盖。

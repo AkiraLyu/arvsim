@@ -1,27 +1,33 @@
 # `src/csr.rs`：控制与状态寄存器
 
-## 功能与实现思路
+## 功能与实现
 
-用 4096 项 `u64` 数组保存完整 12 位 CSR 地址空间；对 `SIE`、`SIP`、`SSTATUS` 做机器寄存器的视图映射，其余地址直接读写。
+`Csr` 用 4096 项 `u64` 数组覆盖 12 位 CSR 地址空间，并为 `SSTATUS`、`SIE` 和 `SIP` 提供机器级寄存器的监督模式视图。CPU 负责检查指令访问权限，本模块负责存储、别名、写掩码、WARL 约束和硬件待处理中断。
 
-## 当前状态
+## 实现状态
 
-部分实现。已定义当前 xv6 路径所需的 M/S-mode CSR、`STIMECMP`、`TIME` 和常用状态/中断位；支持读、写和非零项调试输出。没有规范级权限或字段约束。
+- 实现当前 CPU 使用的 M/S 级 CSR、`TIME`、`STIMECMP`、机器标识 CSR 和 16 个 PMP 表项。
+- `SSTATUS` 只暴露监督模式可见字段；`SIE/SIP` 只暴露 `MIDELEG` 委托的中断位。
+- `mstatus`、`tvec`、委托寄存器、中断寄存器、计数器开关、`menvcfg`、`xepc`、`satp` 和 PMP 均有写掩码或 WARL 处理。
+- UXL/SXL 固定为 RV64；`misa` 和未分配的机器标识固定返回 0；`stimecmp` 复位为 `u64::MAX`。
+- 硬件产生的待处理中断与软件写入的 `MIP` 状态分开保存。CSR 读改写不会把外部硬件信号意外写回软件状态。
+- CPU 会检查 CSR 是否实现、地址编码要求的特权级、只读属性，以及 TVM、计数器和 Sstc 访问条件；非法访问产生非法指令异常。
+- PMP 支持 `pmpcfg0/2`、`pmpaddr0..15`、逐项锁定和 TOR 后继项对前一地址寄存器的锁定。
 
-## 对外接口
+## 公共接口
 
-- 大量公开 CSR 地址和位掩码常量。
-- `Csr::{new, load, store, dump_csr}`。
+- 公开已实现 CSR 的地址、状态位和中断位常量。
+- `Csr::{new, load, store, is_implemented, is_read_only, update_pending, dump_csr}`。
 - `Default` 实现。
 
-## 耦合方式
+## 依赖关系
 
-CPU 持有并直接更新 `Csr`；指令模块执行 CSR 指令时直接调用 `load/store`；没有经过权限检查或 trait。S-mode 视图依赖 `MIDELEG`、`MIE/MIP` 和 `MSTATUS` 的内部关系。
+CPU 持有 `Csr`，负责特权级检查、异常与中断状态切换，以及硬件中断采样。指令模块先调用 CPU 的权限检查，再通过 `load/store` 完成 CSR 指令。PMP 匹配由 CPU 完成，配置和地址保存在 `Csr` 中。
 
-## 已知问题与优化方向
+## 已知问题与改进建议
 
-- 所有 CSR 均可读写，不检查当前特权级、只读编码、WARL/WPRI 或未实现 CSR。
-- `load/store` 是接受任意 `usize` 的公开 API，地址超过 4095 会直接越界 panic；指令路径虽只产生 12 位地址，下游直接调用没有保护。
-- `SSTATUS` 掩码和 SIE/SIP 别名只是子集；`MIDELEG/MIP/MIE` 也缺少规范写掩码。硬件 pending 位与软件存储没有区分，设备或 guest 可互相覆盖状态。
-- supervisor timer pending 由 CPU 临时比较而不是写入 `MIP/SIP.STIP`，读 CSR 观察不到 CPU 即将交付的 timer interrupt；counter/Sstc 权限也未实现。
-- 建议由 CSR 层接收当前 privilege 和访问类型，返回非法指令错误；为每个实现 CSR 定义读写掩码、硬件 pending 输入和副作用，并增加非法地址、只读位和 timer 可见性测试。
+- `load/store` 是公开的底层接口，不接收当前特权级；直接调用可以绕过指令权限检查。传入超过 4095 的地址仍会数组越界。
+- 只实现当前执行核心需要的 CSR 子集；没有 `cycle/instret`、完整性能计数器、调试、浮点、向量或虚拟化状态。
+- `misa` 固定为 0，调用方无法从 CSR 得知实际支持的 I/M/A/C 子集。
+- PMP 只实现基础 16 项模型，没有粒度配置和 Smepmp 等扩展。
+- 后续可用受检的 CSR 访问接口封装地址、特权级和读写类型，同时保留仅供 CPU 内部更新的硬件接口。

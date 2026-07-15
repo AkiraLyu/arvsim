@@ -1,17 +1,17 @@
 # `src/plic.rs`：PLIC 占位模块
 
-## 功能与当前状态
+## 实现状态
 
-实现为空，仅有模块级说明和公开模块路径；正式库没有 PLIC 类型或 MMIO 寄存器实现，状态为占位。
+目前只有模块说明和公开模块名。库中尚未实现 PLIC 类型或 MMIO 寄存器。
 
-## 对外接口
+## 公共接口
 
 只有 `arvsim::plic` 模块路径。
 
-## 耦合方式
+## 依赖关系
 
-正式 `Bus` 可以轮询任意 `MemDevice::pending_interrupt`，但 CLI 未挂载 PLIC。唯一可工作的简化 PLIC 位于 `tests/support/mod.rs`，只仲裁 UART IRQ 10；virtio 虽会设置自身 interrupt status，却没有连接到该 PLIC pending 位。
+库中的 `Bus` 可以通过 `MemDevice::pending_interrupt` 查询设备中断，但命令行平台没有挂载 PLIC。唯一可用的简化实现位于 `tests/support/mod.rs`，只处理 UART 中断号 10（IRQ 10）。测试用 virtio 会设置自己的中断状态，但没有把中断接到 PLIC。
 
-## 优化方向
+## 实现建议
 
-把测试 PLIC 提升为正式设备并去除单 IRQ 假设；实现 source priority、pending、enable、context threshold、claim/complete，多 context/hart 和设备 raise/lower API；测试机器与 CLI 共用同一实现。
+将测试用 PLIC 移到库中的设备模块，并取消只支持一个中断源的限制。需要实现中断源优先级、待处理位、使能位、上下文阈值、领取/完成（claim/complete）操作、多上下文和多硬件线程，以及供设备触发或清除中断的接口。命令行程序和测试应共用这一实现。

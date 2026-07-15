@@ -1,37 +1,37 @@
-# 不完善之处和优化路线
+# 已知问题与改进计划
 
-本文只保留当前未完成的工作；已经落地并有回归证据的历史事项不再占用路线图编号。
+本文只列尚未完成的工作。已经完成并有测试证明的事项不再保留。
 
 ## P0：修复已确认的正确性和健壮性问题
 
-1. 用结构化 next-PC/执行结果替代“执行后 PC 是否变化”的提交启发式；当前合法的零偏移 branch/jump 会被错误地额外前进 4 字节。
-2. 在总线边界限制访问宽度并使用 checked range；当前 `size=0` 可命中设备，DRAM/TestBus 的大宽度读写可能因移位或下标运算在宿主 panic。
-3. 为 system/atomic 边界补精确回归并修正语义：`ecall` 目前绕过统一异常入口且固定进入 S-mode，LR 使用 Store 权限翻译，SC 不维护 reservation。
+1. 在总线入口限制访问宽度，并对地址和长度做溢出检查。当前 `size=0` 仍可能命中设备；DRAM 和 `TestBus` 遇到过大的访问宽度时，可能因移位或下标越界使宿主进程异常退出。
+2. 实现加载、存储和 AMO 的对齐检查；为 LR/SC 记录保留状态，并保证 64 位存储或 AMO 不会留下半次写入和 MMIO 副作用。
+3. 按指令长度取指。当前 CPU 总是读取 4 字节，16 位压缩指令位于映射末端时会错误地产生取指访问异常。
 
-## P1：收敛架构边界
+## P1：理清模块职责
 
-1. 收口运行期 `Machine` 边界：`run()` 必须复用 `Machine::step()`，测试/runner 不再直接推进 CPU，并为平台设备增加 tick/reset 生命周期。
-2. 将测试 UART、PLIC、virtio-blk 提升为正式模块；测试与 CLI 使用同一设备实现。
-3. 把 `MemDevice::write` 扩为 `u64` 并引入受限访问宽度；定义类型化 interrupt source/cause，区分本地、外部和最终 trap cause。
-4. 为默认关闭且使用 ELF 动态符号的 `Xv6Accelerator` 增加 fixture commit、结构布局、符号范围和用户二进制地址校验，并限制 guest 可控的宿主分配/循环规模。
-5. 缩小公共字段和模块可见性，给库提供稳定的构建器、loader 和运行控制接口。
+1. 统一由 `Machine` 管理运行：`run()` 应反复调用 `Machine::step()`，测试代码和临时运行程序不再直接推进 CPU；平台设备也要有统一的时钟推进和复位接口。
+2. 将测试 UART、PLIC、virtio-blk 移入库中；测试与命令行程序使用同一设备实现。
+3. 把 `MemDevice::write` 的值扩为 `u64`，并用枚举限制访问宽度；分别表示本地中断、外部中断和最终写入异常寄存器的中断原因。
+4. 为 `Xv6Accelerator` 校验 xv6 提交版本、结构布局、符号范围和用户程序地址，并限制目标程序可控制的宿主内存分配与循环次数。
+5. 减少公开字段和公开模块，为库提供稳定的构建器、镜像装载和运行控制接口。
 
 ## P2：提升 RISC-V 语义完整性
 
-1. 显式建模 U/S/M privilege、delegation、trap 向量模式和返回状态。
-2. 完善 CSR 权限、只读/WARL、pending/enable 关系与 counter/timer；把当前 Sstc 式快捷计时器与未来 CLINT/ACLINT 平台设备分开。
-3. 完善 Sv39 canonical address、A/D、SUM/MXR、superpage 对齐、页表访问错误和可选 TLB。
-4. 实现取指/访存对齐异常、LR/SC reservation、aq/rl、多 hart 内存序；修复压缩指令位于映射末端时被 4 字节统一取指误伤的问题。
-5. 将指令模块按 I/M/A/C/system 拆分并接入 riscv-arch-test，明确并验证对外宣称的 ISA 字符串。
+1. 扩展 CSR 和 PMP 覆盖范围，提供可用的 `misa` 能力声明，并补充性能计数器等通用软件常用寄存器。
+2. 为 Sv39 增加 ASID、TLB 和 `sfence.vma` 刷新语义；继续补充跨页访问和页表更新失败的边界测试。
+3. 实现 aq/rl 和多硬件线程内存顺序；明确单硬件线程模式下 `wfi` 与中断唤醒的行为。
+4. 补齐 RVC，并按 I/M/A/C/system 拆分指令模块；接入 riscv-arch-test，测试并记录实际支持的 ISA。
+5. 将 Sstc 与未来的 CLINT/ACLINT 分开：保留 `stimecmp/STIP`，另行实现 `msip/mtime/mtimecmp` 或 ACLINT 对应设备。
 
 ## P3：可复现性、性能与工程质量
 
-1. 固定 xv6 commit 和 fixture 校验值；让 fixture 缺失成为明确 skip/fail 而非绿色通过，把短 boot smoke 放入 CI、usertests 放入 nightly。
-2. 把 `run_xv6_cli.sh` 的临时 runner 替换为正式 Cargo binary/example。
-3. 将现有 `off/pc/full` 调试级别扩展为可注入 trace sink 和交互式 debugger，避免核心直接打印 stdout。
-4. 评估 basic-block cache、译码缓存或 JIT；先用 benchmark 量化热点，再减少对 guest 函数语义的硬编码。
-5. 把当前可通过的 `cargo fmt --check` 和 clippy 固化为 CI gate，并继续加入覆盖率、Miri、fuzz/property tests 与设备非法输入测试。
+1. 固定 xv6 提交版本和测试文件校验值；明确区分“跳过”和“失败”；在持续集成（CI）中运行短启动测试，在定时任务中运行 usertests。
+2. 将 `run_xv6_cli.sh` 生成的临时程序改为正式的 Cargo 可执行目标或示例程序。
+3. 在现有 `off/pc/full` 调试级别之外提供可注入的跟踪输出接口和交互式调试器，避免核心代码直接打印到标准输出。
+4. 先用基准测试确认性能热点，再评估基本块缓存、译码缓存或 JIT，并逐步减少针对 xv6 函数的硬编码加速。
+5. 将 `cargo fmt --check` 和 clippy 设为持续集成必检项，并继续加入覆盖率、Miri、模糊测试、属性测试和非法设备输入测试。
 
 ## 建议验收顺序
 
-每个阶段都应先通过小型 ISA/设备测试，再运行 xv6 boot smoke，最后运行 quick/full usertests。只有正式 CLI 与测试使用同一平台实现后，xv6 测试结果才能代表对外运行能力。
+每个阶段先运行小型 ISA 和设备测试，再运行 xv6 启动测试，最后运行快速和完整 usertests。只有命令行程序与测试共用同一套平台实现后，xv6 测试结果才能代表库对外提供的功能。

@@ -1,27 +1,27 @@
 # `tests/xv6_fixture.rs`：xv6 验收测试
 
-## 功能与实现思路
+## 功能与实现
 
-以 UART 文本为黑盒观察点，分层验证 fixture、内核启动、shell、基础用户程序、快速 usertests 和完整 usertests。步数预算可由 `ARVSIM_XV6_*_STEPS` 环境变量覆盖，运行过程中检查 panic/FAILED 等失败标记。
+测试根据 UART 输出判断 xv6 运行进度，依次检查测试文件、内核启动、shell、基础用户程序、快速 usertests 和完整 usertests。可用 `ARVSIM_XV6_*_STEPS` 环境变量调整各阶段步数上限，并检查输出中是否出现 `panic`、`FAILED` 等失败标记。
 
-## 当前状态
+## 实现状态
 
-- fixture 完整性检查默认执行；如果构件不存在会直接打印提示并返回成功，因此默认通过不证明 fixture 可构建或 xv6 可运行。
-- 启动、基础命令、quick usertests、full usertests 共 4 个合同全部 `#[ignore]`。
-- ignore 原因明确标注它们是依赖外部 fixture 和长预算的 opt-in 合同。本轮没有重新执行长测试，因此当前结论是“存在合同，未由本轮复核行为结果”。
+- 测试文件检查默认执行；如果文件不存在，只打印提示并返回成功。因此该测试通过并不能证明 xv6 测试文件可生成，也不能证明 xv6 可以运行。
+- 启动、基础命令、快速 usertests 和完整 usertests 共 4 个验收测试，都标有 `#[ignore]`，需要手动运行。
+- 当前工作区已通过启动到 shell、基础用户程序和快速 usertests 验证。完整 usertests 本次未运行。
 
-## 对外接口
+## 配置方式
 
-测试本身无产品接口。相关环境变量控制 banner、init、shell、命令和 usertests 各阶段最大步数；执行入口见 [`scripts.md`](./scripts.md)。
+本文件不提供库接口。环境变量可分别控制启动信息、init、shell、命令和 usertests 的最大步数；运行方法见 [`scripts.md`](./scripts.md)。
 
-## 耦合方式
+## 依赖关系
 
-强依赖 `tests/support` 的平台模型、外部 xv6 kernel/fs fixture、特定启动输出和用户程序文本。完整测试最大预算达 20 亿步，性能依赖 CPU 内的 xv6 快速路径。
+测试依赖 `tests/support` 中的平台实现、外部 xv6 内核和文件系统镜像，以及固定的启动和用户程序输出。完整测试最多允许执行 20 亿步，并依赖 CPU 中的 xv6 加速才能在可接受时间内完成。2026-07-13 的具体命令和结果见 [`verification.md`](./verification.md)。
 
-## 不完善之处和优化方向
+## 已知问题与改进建议
 
-- fixture 缺失时测试“绿色跳过”而不是 Cargo ignored/明确 skip，可能造成错误安全感。
-- 默认 CI 不执行任何 xv6 行为合同，快速路径或设备回归可能长期未发现。
-- 构建脚本会记录实际 commit，但测试不读取 `fixture.env`、不校验 commit/构件哈希，也没有把固定结构偏移与 fixture 版本绑定。
+- 缺少测试文件时，测试仍显示通过，而不是明确报告跳过或失败，容易让人误以为 xv6 已经验证。
+- 默认的持续集成流程不运行 xv6 行为测试，CPU 加速或设备回归可能长期无法发现。
+- 构建脚本会记录实际 xv6 提交版本，但测试不读取 `fixture.env`，也不校验提交版本和测试文件哈希；固定结构偏移没有与 xv6 版本绑定。
 - 以自由文本匹配判断状态易受上游输出变化影响。
-- 建议增加短时 boot smoke 到定期 CI，长测放 nightly；固定 xv6 commit 并记录 fixture 哈希；区分 skip/pass；为关键阶段提供结构化退出/signature。
+- 建议在日常持续集成中加入短启动测试，把长测试放到定时任务；固定 xv6 提交版本并记录测试文件哈希；明确区分跳过和通过；为关键阶段增加便于程序识别的结束标记。

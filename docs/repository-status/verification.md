@@ -2,46 +2,53 @@
 
 ## 本轮执行结果
 
-执行日期：2026-07-11。分析基线：提交 `008ae8b` 加当前未提交工作树；验证命令针对实际工作树执行。
+执行日期：2026-07-13。基线为提交 `822629c`，同时包含当前工作区中的特权级实现；以下结果对应文档描述的当前代码。
 
 ### 默认与静态检查
 
 `cargo test --all-targets` 通过：
 
-- 库单元测试：20 passed。
-- `src/main.rs`：3 passed。
-- `tests/cli.rs`：3 passed。
-- `tests/rv64i_smoke.rs`：3 passed。
-- `tests/xv6_fixture.rs`：1 passed，4 ignored。
-- 合计 30 passed、4 ignored、0 failed。
+- 库单元测试：41 个通过。
+- `src/main.rs`：3 个通过。
+- `tests/cli.rs`：3 个通过。
+- `tests/rv64i_smoke.rs`：3 个通过。
+- `tests/xv6_fixture.rs`：1 个通过，4 个未执行。
+- 合计：51 个通过，4 个未执行，没有失败。
 
 其他检查：
 
-- `cargo test --doc`：通过，当前 0 个 doc test。
+- `cargo test --doc`：通过；当前没有文档测试。
 - `RUSTDOCFLAGS='-D warnings' cargo doc --no-deps`：通过。
 - `cargo fmt --all -- --check`：通过。
-- `cargo clippy --lib --bin arvsim -- -D warnings`：通过。
 - `cargo clippy --all-targets -- -D warnings`：通过。
-- `bash -n scripts/build_xv6_fixture.sh scripts/run_testbench.sh scripts/run_xv6_cli.sh`：通过。
 - `git diff --check`：通过。
-- `docs/**/*.md` 相对链接与空文件检查：通过；原有两个空白占位文档已移除，索引不再指向空页面。
 
-默认回归覆盖 flat/ELF 装载、BSS 清零、参数解析、平台区域冲突、真实 CLI 退出码、CPU 运行限制/reset、CSR 别名、基础指令合同和测试 UART。它没有覆盖完整特权状态机、关键 trap/MMU/interrupt 语义、正式 UART 输入、CLINT/PLIC 或 xv6 行为合同。
+默认测试除原有的镜像装载、参数解析、平台组装、基础指令和 UART 外，还覆盖：
 
-### 已有 xv6 回归记录（本轮未复核）
+- U/S/M 复位状态、异常委托、机器模式不可向下委托，以及 `sret/mret` 状态恢复。
+- 中断委托、全局使能、优先级和 `tvec` 向量模式。
+- CSR 特权级、只读和未实现地址检查，以及 TVM、TSR、计数器和 Sstc 权限。
+- 16 个 PMP 表项、锁定、TOR/NAPOT、最低编号优先、部分覆盖和 MPRV。
+- Sv39 的 U/S/SUM/MXR 权限、A/D 位、规范地址、PMP 与总线错误地址。
+- Sstc 的 `STIP` 可见性及关闭 STCE 后的清除行为。
+- 实际执行 `mret` 进入用户模式，再由用户态 `ecall` 进入委托的监督模式异常入口。
 
-2026-07-10 曾针对 fixture commit `1982fd12595f52a0e5ef8db466257a01fb1fbfef` 验证动态解析 `Xv6Accelerator` 符号后的启动与基础 shell 合同：`run_xv6_cli.sh --boot-only` 到达 shell，启动测试与 `echo/ls/cat README` 合同通过。这些结果说明当时的 fixture 可用，但不作为 2026-07-11 当前工作树的重新执行证据。
+### xv6 验证
 
-### 未执行项
+当前工作区重新执行了以下验证：
 
-未运行 `cargo test --test xv6_fixture -- --ignored`：四个测试需要外部 fixture，最长预算为 20 亿步，不适合作为本轮状态扫描的即时命令。默认执行的 fixture 完整性测试在构件缺失时会返回成功，因此其他环境中的绿色默认测试不能证明 xv6 fixture 存在。
+- `./scripts/run_xv6_cli.sh --boot-only`：成功进入 shell，共执行 5,620,000 步。
+- `cargo test --release --test xv6_fixture xv6_shell_runs_basic_user_programs -- --ignored`：通过，覆盖 `echo`、`ls` 和 `cat README`。
+- `cargo test --release --test xv6_fixture xv6_runs_quick_usertests -- --ignored`：通过，输出 `ALL TESTS PASSED`。
+
+没有运行完整 usertests。该测试最长允许执行 20 亿步，仍需显式执行。4 个 xv6 行为测试默认均为 `ignored`；默认的文件检查在缺少测试文件时也会返回成功，因此不能只凭默认测试判断 xv6 是否可运行。
 
 ## 覆盖缺口
 
-- CLI 已有参数单元测试和 3 个真实进程测试，但 ELF、调试输出、UART 平台与 guest exception 进程路径尚未覆盖。
-- CPU 有运行循环和 reset 单元测试；零偏移控制流、关键特权、trap、MMU 和中断语义没有精确回归。
-- Bus 只测基本读写与区域末端；重叠/溢出通过 `Platform` 间接覆盖，零宽/非法宽度、中断顺序和直接 `Bus::attach_device` panic 合同未覆盖。
-- 指令测试仅有解码和立即数小测试，大部分执行语义没有精确回归。
-- `Machine` 测试证明转发和组装可用，但不覆盖设备 tick/reset；测试 helper 仍直接调用 CPU。
-- 测试 PLIC/virtio 没有独立设备测试，畸形访问或 descriptor 可导致 panic/错误类型混用。
-- 格式和 clippy 当前手工通过，但仓库没有 CI gate，也没有 Miri、fuzz、riscv-arch-test 或覆盖率门槛。
+- 命令行已有参数单元测试和 3 个进程测试，但还没有覆盖 ELF、调试输出、UART 平台、地址冲突和目标程序异常退出。
+- 特权级、异常、PMP、Sv39 和中断已有针对性单元测试，但尚未覆盖所有 CSR 组合、跨页访问、数据访问对齐异常、TLB/ASID 和 LR/SC 保留。
+- `Bus` 只测试基本读写和区域末端。区域重叠与溢出由 `Platform` 间接测试；零宽、非法宽度、中断顺序，以及直接调用 `Bus::attach_device` 导致进程异常退出的情况尚未覆盖。
+- 指令模块自身的测试仍主要覆盖解码和立即数；很多执行规则通过 CPU 集成测试间接覆盖，缺少逐条 ISA 测试。
+- `Machine` 测试只证明转发和组装可用，没有覆盖设备推进与复位；测试辅助代码仍会直接调用 CPU。
+- 测试用 PLIC 和 virtio 没有独立设备测试；异常访问或错误描述符可能使进程异常退出，错误类型也可能不准确。
+- 格式和 clippy 已手工通过，但仓库还没有持续集成必检项，也没有 Miri、模糊测试、riscv-arch-test 或覆盖率要求。

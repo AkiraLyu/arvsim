@@ -1,8 +1,8 @@
 //! 单 hart RV64 CPU 状态和执行循环。
 //!
-//! [`Cpu::step`] 依次推进时间、处理中断、尝试可选 xv6 加速、取指、译码执行并提交 PC。
-//! 地址翻译和监督模式 trap 也集中在本模块；具体物理内存和设备通过 [`MemDevice`] 注入。
-//! 当前实现没有独立的特权级字段，部分监督/用户判断沿用现有 PC 地址范围约定。
+//! [`Cpu::step`] 依次推进时间、处理中断、取指、尝试可选 xv6 加速、译码执行并提交 PC。
+//! U/S/M 特权级、地址翻译和 trap 路由集中在本模块；具体物理内存和设备通过
+//! [`MemDevice`] 注入。
 
 use crate::bus::MemDevice;
 use crate::csr;
@@ -19,11 +19,34 @@ pub struct Cpu {
     pub bus: Box<dyn MemDevice>,
     /// 当前 hart 的控制与状态寄存器文件。
     pub csr: csr::Csr,
+    /// 当前执行特权级；复位后为机器模式。
+    pub privilege: PrivilegeMode,
     /// 模拟周期计数；每次 `step` 按固定粒度增加。
     pub cycles: u64,
     reset_vector: u64,
     initial_sp: u64,
+    pc_written: bool,
     xv6_accelerator: Option<Xv6Accelerator>,
+}
+
+/// RISC-V 基础特权级编码。
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum PrivilegeMode {
+    User = 0,
+    Supervisor = 1,
+    Machine = 3,
+}
+
+impl PrivilegeMode {
+    fn from_encoding(value: u64) -> Option<Self> {
+        match value {
+            0 => Some(Self::User),
+            1 => Some(Self::Supervisor),
+            3 => Some(Self::Machine),
+            _ => None,
+        }
+    }
 }
 
 /// 执行循环输出的调试信息级别。
@@ -103,9 +126,32 @@ const XV6_PTE_R: u64 = 1 << 1;
 const XV6_PTE_W: u64 = 1 << 2;
 const XV6_PTE_X: u64 = 1 << 3;
 const TIMER_CYCLES_PER_STEP: u64 = 10;
+const INTERRUPT_FLAG: u64 = 1 << 63;
+const INTERRUPT_PRIORITY: [u64; 6] = [11, 3, 7, 9, 1, 5];
+
+const PTE_VALID: u64 = 1 << 0;
+const PTE_READ: u64 = 1 << 1;
+const PTE_WRITE: u64 = 1 << 2;
+const PTE_EXECUTE: u64 = 1 << 3;
+const PTE_USER: u64 = 1 << 4;
+const PTE_ACCESSED: u64 = 1 << 6;
+const PTE_DIRTY: u64 = 1 << 7;
+const PTE_PPN_MASK: u64 = (1 << 44) - 1;
+const PTE_RESERVED_SHIFT: u32 = 54;
+
+const PMP_CFG_READ: u8 = 1 << 0;
+const PMP_CFG_WRITE: u8 = 1 << 1;
+const PMP_CFG_EXECUTE: u8 = 1 << 2;
+const PMP_CFG_ADDRESS_SHIFT: u32 = 3;
+const PMP_CFG_ADDRESS_MASK: u8 = 0b11;
+const PMP_CFG_LOCKED: u8 = 1 << 7;
+const PMP_ADDRESS_OFF: u8 = 0;
+const PMP_ADDRESS_TOR: u8 = 1;
+const PMP_ADDRESS_NA4: u8 = 2;
+const PMP_ADDRESS_NAPOT: u8 = 3;
 
 /// 一次虚拟地址访问的用途，用于选择页权限和页错误类型。
-#[derive(Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum MemoryAccess {
     Fetch,
     Load,
@@ -125,9 +171,11 @@ impl Cpu {
             pc: reset_vector,
             bus,
             csr: csr::Csr::new(),
+            privilege: PrivilegeMode::Machine,
             cycles: 0,
             reset_vector,
             initial_sp,
+            pc_written: false,
             xv6_accelerator: None,
         };
         cpu.registers[2] = initial_sp;
@@ -140,7 +188,9 @@ impl Cpu {
         self.registers[2] = self.initial_sp;
         self.pc = self.reset_vector;
         self.csr = csr::Csr::new();
+        self.privilege = PrivilegeMode::Machine;
         self.cycles = 0;
+        self.pc_written = false;
     }
 
     /// 启用与当前 xv6 镜像匹配的快速路径。
@@ -153,28 +203,34 @@ impl Cpu {
         self.xv6_accelerator = None;
     }
 
+    pub(crate) fn xv6_acceleration_enabled(&self) -> bool {
+        self.xv6_accelerator.is_some()
+    }
+
     /// 推进一个 CPU 步骤。
     ///
-    /// 中断或快速路径被接管时也算一个成功步骤；未被 guest trap 接管的异常才返回 `Err`。
+    /// 中断或异常被架构 trap 入口接管时也算一个成功步骤。
     pub fn step(&mut self) -> Result<(), Exception> {
         // 先推进时间，使本步开始时即可观察到刚到期的定时器中断。
         self.tick();
         if self.take_pending_interrupt() {
             return Ok(());
         }
-        if self.try_xv6_fast_path()? {
-            return Ok(());
-        }
         let instruction = match self.fetch() {
             Ok(instruction) => instruction,
-            Err(e) => {
-                // 取指失败与执行异常走同一 trap 入口；没有 STVEC 时再上报宿主。
-                if self.trap_exception(e) {
-                    return Ok(());
-                }
-                return Err(e);
+            Err(exception) => {
+                self.trap_exception(exception);
+                return Ok(());
             }
         };
+        match self.try_xv6_fast_path() {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(exception) => {
+                self.trap_exception(exception);
+                return Ok(());
+            }
+        }
         let new_pc = self.execute(instruction)?;
         self.pc = new_pc;
         Ok(())
@@ -214,45 +270,93 @@ impl Cpu {
     ///
     /// 压缩指令只使用低 16 位；统一读取 4 字节可让译码入口保持单一格式。
     fn fetch(&mut self) -> Result<u64, Exception> {
-        let addr = self.translate(self.pc, MemoryAccess::Fetch)?;
-        self.bus.read(addr, 4)
+        if self.pc & 1 != 0 {
+            return Err(Exception::InstructionAddrMisaligned(self.pc));
+        }
+        let addr = self.translate_sized(self.pc, MemoryAccess::Fetch, 4)?;
+        self.bus
+            .read(addr, 4)
+            .map_err(|_| Exception::InstructionAccessFault(self.pc))
     }
     /// 译码并执行一条指令，返回提交后的 PC。
     fn execute(&mut self, instruction: u64) -> Result<u64, Exception> {
         let old_pc = self.pc;
+        self.pc_written = false;
         let inst = instruction as u32;
         let decoded = instruction::decode(inst);
         match instruction::execute(self, decoded) {
             Ok(_) => {
-                // 当前以“PC 是否变化”推断执行器有没有提交控制流或压缩指令。
-                // 因此合法的零偏移 branch/jump 会被误判为普通 32 位指令并额外前进 4；
-                // 后续应让执行器返回结构化 next-PC，而不是继续扩展这一启发式规则。
-                if self.pc == old_pc {
-                    Ok(self.pc.wrapping_add(4))
-                } else {
+                if self.pc_written {
                     Ok(self.pc)
+                } else {
+                    Ok(old_pc.wrapping_add(4))
                 }
             }
-            Err(e) => {
-                // 异常必须以故障指令 PC 作为 SEPC，因此先撤销执行器可能留下的 PC 变化。
+            Err(exception) => {
+                // 异常必须以故障指令 PC 作为 xEPC，因此先撤销执行器可能留下的 PC 变化。
                 self.pc = old_pc;
-                if self.trap_exception(e) {
-                    return Ok(self.pc);
-                }
-                Err(e)
+                self.pc_written = false;
+                self.trap_exception(exception);
+                Ok(self.pc)
             }
         }
     }
 
-    fn trap_exception(&mut self, exception: Exception) -> bool {
-        let Some((scause, stval)) = exception_trap_info(exception) else {
-            return false;
+    fn trap_exception(&mut self, exception: Exception) {
+        let cause = exception.cause();
+        let delegated = self.privilege != PrivilegeMode::Machine
+            && self.csr.load(csr::MEDELEG) & (1 << cause) != 0;
+        let target = if delegated {
+            PrivilegeMode::Supervisor
+        } else {
+            PrivilegeMode::Machine
         };
-        // STVEC 为零表示 guest 尚未安装监督模式入口，此时把异常交还调用方。
-        if self.csr.load(csr::STVEC) == 0 {
+        self.enter_trap(target, cause, exception.value());
+    }
+
+    /// 记录由当前指令明确写入的下一条 PC。
+    pub(crate) fn write_pc(&mut self, pc: u64) {
+        self.pc = pc;
+        self.pc_written = true;
+    }
+
+    /// 检查当前特权级能否按指定方式访问 CSR。
+    pub(crate) fn csr_access_allowed(&self, addr: usize, write: bool) -> bool {
+        if !csr::Csr::is_implemented(addr) || (write && csr::Csr::is_read_only(addr)) {
             return false;
         }
-        self.enter_supervisor_trap(scause, stval);
+
+        let required = (addr >> 8) & 0b11;
+        if (self.privilege as usize) < required {
+            return false;
+        }
+
+        if self.privilege == PrivilegeMode::Supervisor
+            && addr == csr::SATP
+            && self.csr.load(csr::MSTATUS) & csr::MASK_TVM != 0
+        {
+            return false;
+        }
+
+        if addr == csr::TIME {
+            let machine_enabled = self.csr.load(csr::MCOUNTEREN) & csr::MASK_COUNTEREN_TM != 0;
+            return match self.privilege {
+                PrivilegeMode::Machine => true,
+                PrivilegeMode::Supervisor => machine_enabled,
+                PrivilegeMode::User => {
+                    machine_enabled && self.csr.load(csr::SCOUNTEREN) & csr::MASK_COUNTEREN_TM != 0
+                }
+            };
+        }
+
+        if addr == csr::STIMECMP && self.privilege != PrivilegeMode::Machine {
+            let enabled = self.csr.load(csr::MENVCFG) & csr::MASK_STCE != 0
+                && self.csr.load(csr::MCOUNTEREN) & csr::MASK_COUNTEREN_TM != 0;
+            if !enabled {
+                return false;
+            }
+        }
+
         true
     }
 
@@ -268,16 +372,35 @@ impl Cpu {
         }
     }
 
-    /// 根据当前 `SATP` 把虚拟地址翻译为物理地址，并检查访问类型对应的页权限。
-    ///
-    /// `satp.mode=0` 直接返回原地址，mode 8 使用三级 Sv39 页表；其他模式在当前模型中返回页错误。
+    /// 根据当前有效特权级和 `SATP` 翻译地址，并检查 Sv39 页权限。
     pub fn translate(&mut self, addr: u64, access: MemoryAccess) -> Result<u64, Exception> {
+        self.translate_sized(addr, access, 1)
+    }
+
+    pub(crate) fn translate_sized(
+        &mut self,
+        addr: u64,
+        access: MemoryAccess,
+        size: usize,
+    ) -> Result<u64, Exception> {
+        let privilege = self.effective_privilege(access);
+        if privilege == PrivilegeMode::Machine {
+            return self.check_physical_access(addr, size, privilege, access);
+        }
+
         let satp = self.csr.load(csr::SATP);
         let mode = satp >> 60;
         if mode == 0 {
-            return Ok(addr);
+            return self.check_physical_access(addr, size, privilege, access);
         }
         if mode != 8 {
+            return Err(page_fault(access, addr));
+        }
+
+        let sign = (addr >> 38) & 1;
+        let upper = addr >> 39;
+        let canonical_upper = if sign == 0 { 0 } else { (1 << 25) - 1 };
+        if upper != canonical_upper {
             return Err(page_fault(access, addr));
         }
 
@@ -288,76 +411,217 @@ impl Cpu {
             (addr >> 30) & 0x1ff,
         ];
         // SATP 的低 44 位是根页表物理页号，恢复物理地址时补回 12 个零位。
-        let mut table = (satp & ((1u64 << 44) - 1)) << 12;
+        let mut table = (satp & PTE_PPN_MASK) << 12;
 
         for level in (0..=2).rev() {
             let pte_addr = table + vpn[level] * 8;
-            let pte = self.bus.read(pte_addr, 8)?;
-            let valid = pte & 0x1 != 0;
-            let readable = pte & 0x2 != 0;
-            let writable = pte & 0x4 != 0;
-            let executable = pte & 0x8 != 0;
-            let user = pte & 0x10 != 0;
-            // RISC-V 将 W=1、R=0 视为保留的非法叶子组合。
-            if !valid || (writable && !readable) {
+            self.check_pmp(pte_addr, 8, PrivilegeMode::Supervisor, MemoryAccess::Load)
+                .map_err(|_| access_fault(access, addr))?;
+            let pte = self
+                .bus
+                .read(pte_addr, 8)
+                .map_err(|_| access_fault(access, addr))?;
+            let valid = pte & PTE_VALID != 0;
+            let readable = pte & PTE_READ != 0;
+            let writable = pte & PTE_WRITE != 0;
+            let executable = pte & PTE_EXECUTE != 0;
+            let user = pte & PTE_USER != 0;
+            let accessed = pte & PTE_ACCESSED != 0;
+            let dirty = pte & PTE_DIRTY != 0;
+            // RISC-V 将 W=1、R=0 和未实现的高位编码视为非法 PTE。
+            if !valid || (writable && !readable) || pte >> PTE_RESERVED_SHIFT != 0 {
                 return Err(page_fault(access, addr));
             }
 
             if readable || executable {
-                // 当前模型用 PC 是否落在 DRAM 以下近似用户态；用户访问不能落到 U=0 的页。
-                if self.pc < crate::cfg::DRAM_BASE && !user {
-                    return Err(page_fault(access, addr));
-                }
+                let mstatus = self.csr.load(csr::MSTATUS);
+                let privilege_allowed = match privilege {
+                    PrivilegeMode::User => user,
+                    PrivilegeMode::Supervisor if access == MemoryAccess::Fetch => !user,
+                    PrivilegeMode::Supervisor => !user || mstatus & csr::MASK_SUM != 0,
+                    PrivilegeMode::Machine => true,
+                };
                 let allowed = match access {
                     MemoryAccess::Fetch => executable,
-                    MemoryAccess::Load => readable,
+                    MemoryAccess::Load => readable || (executable && mstatus & csr::MASK_MXR != 0),
                     MemoryAccess::Store => writable,
                 };
-                if !allowed {
+                if !privilege_allowed || !allowed {
                     return Err(page_fault(access, addr));
                 }
 
-                let page_bits = 12 + 9 * level;
+                let ppn = (pte >> 10) & PTE_PPN_MASK;
+                let superpage_bits = 9 * level;
+                if superpage_bits != 0 && ppn & ((1 << superpage_bits) - 1) != 0 {
+                    return Err(page_fault(access, addr));
+                }
+
+                let page_bits = 12 + superpage_bits;
                 let page_mask = (1u64 << page_bits) - 1;
-                let ppn = (pte >> 10) & ((1u64 << 44) - 1);
-                // 叶子可出现在任意层；低位来自虚拟地址，因而同时覆盖普通页和大页。
-                return Ok(((ppn << 12) & !page_mask) | (addr & page_mask));
+                let physical = ((ppn << 12) & !page_mask) | (addr & page_mask);
+                self.check_pmp(physical, size, privilege, access)
+                    .map_err(|()| access_fault(access, addr))?;
+
+                if !accessed || (access == MemoryAccess::Store && !dirty) {
+                    let updated = pte
+                        | PTE_ACCESSED
+                        | if access == MemoryAccess::Store {
+                            PTE_DIRTY
+                        } else {
+                            0
+                        };
+                    self.check_pmp(pte_addr, 8, PrivilegeMode::Supervisor, MemoryAccess::Store)
+                        .map_err(|_| access_fault(access, addr))?;
+                    self.bus
+                        .write(pte_addr, updated as u32, 4)
+                        .map_err(|_| access_fault(access, addr))?;
+                }
+
+                return Ok(physical);
             }
 
-            table = ((pte >> 10) & ((1u64 << 44) - 1)) << 12;
+            if pte & (PTE_USER | PTE_ACCESSED | PTE_DIRTY) != 0 {
+                return Err(page_fault(access, addr));
+            }
+
+            table = ((pte >> 10) & PTE_PPN_MASK) << 12;
         }
 
         Err(page_fault(access, addr))
     }
 
-    /// 保存监督模式 trap 状态并跳转到 `STVEC` 的直接入口。
-    pub fn enter_supervisor_trap(&mut self, scause: u64, stval: u64) {
-        let mut sstatus = self.csr.load(csr::SSTATUS);
-        let was_sie = sstatus & csr::MASK_SIE != 0;
-        if self.pc >= crate::cfg::DRAM_BASE {
-            sstatus |= csr::MASK_SPP;
+    fn effective_privilege(&self, access: MemoryAccess) -> PrivilegeMode {
+        let mstatus = self.csr.load(csr::MSTATUS);
+        if self.privilege == PrivilegeMode::Machine
+            && access != MemoryAccess::Fetch
+            && mstatus & csr::MASK_MPRV != 0
+        {
+            PrivilegeMode::from_encoding((mstatus & csr::MASK_MPP) >> 11)
+                .expect("mstatus.MPP contains only implemented privilege modes")
         } else {
-            sstatus &= !csr::MASK_SPP;
+            self.privilege
         }
-        // SIE 被压入 SPIE，随后关闭全局监督模式中断，供 sret 对称恢复。
-        if was_sie {
-            sstatus |= csr::MASK_SPIE;
-        } else {
-            sstatus &= !csr::MASK_SPIE;
-        }
-        sstatus &= !csr::MASK_SIE;
-
-        self.csr.store(csr::SSTATUS, sstatus);
-        self.csr.store(csr::SEPC, self.pc);
-        self.csr.store(csr::SCAUSE, scause);
-        self.csr.store(csr::STVAL, stval);
-        // 当前实现只进入直接基址，清除 STVEC 低两位的模式编码。
-        self.pc = self.csr.load(csr::STVEC) & !0x3;
     }
 
-    /// 按当前简化的 `sret` 规则恢复中断状态并返回 `SEPC`。
+    fn check_physical_access(
+        &self,
+        addr: u64,
+        size: usize,
+        privilege: PrivilegeMode,
+        access: MemoryAccess,
+    ) -> Result<u64, Exception> {
+        self.check_pmp(addr, size, privilege, access)
+            .map(|()| addr)
+            .map_err(|()| access_fault(access, addr))
+    }
+
+    fn check_pmp(
+        &self,
+        addr: u64,
+        size: usize,
+        privilege: PrivilegeMode,
+        access: MemoryAccess,
+    ) -> Result<(), ()> {
+        let end = addr
+            .checked_add(size as u64)
+            .filter(|end| *end > addr)
+            .ok_or(())?;
+        let required = match access {
+            MemoryAccess::Fetch => PMP_CFG_EXECUTE,
+            MemoryAccess::Load => PMP_CFG_READ,
+            MemoryAccess::Store => PMP_CFG_WRITE,
+        };
+        let mut previous = 0;
+        for index in 0..csr::PMP_ENTRIES {
+            let config = self.csr.pmp_config(index);
+            let address = self.csr.pmp_address(index);
+            if let Some((start, limit)) = pmp_range(previous, address, config)
+                && addr < limit
+                && end > start
+            {
+                if addr < start || end > limit {
+                    return Err(());
+                }
+                if privilege == PrivilegeMode::Machine && config & PMP_CFG_LOCKED == 0 {
+                    return Ok(());
+                }
+                return if config & required != 0 {
+                    Ok(())
+                } else {
+                    Err(())
+                };
+            }
+            previous = address;
+        }
+
+        (privilege == PrivilegeMode::Machine)
+            .then_some(())
+            .ok_or(())
+    }
+
+    /// 保存监督模式 trap 状态并跳转到 `STVEC`。
+    pub fn enter_supervisor_trap(&mut self, scause: u64, stval: u64) {
+        self.enter_trap(PrivilegeMode::Supervisor, scause, stval);
+    }
+
+    /// 保存机器模式 trap 状态并跳转到 `MTVEC`。
+    pub fn enter_machine_trap(&mut self, mcause: u64, mtval: u64) {
+        self.enter_trap(PrivilegeMode::Machine, mcause, mtval);
+    }
+
+    fn enter_trap(&mut self, target: PrivilegeMode, cause: u64, value: u64) {
+        let previous = self.privilege;
+        let vector = match target {
+            PrivilegeMode::Machine => {
+                let mut mstatus = self.csr.load(csr::MSTATUS);
+                if mstatus & csr::MASK_MIE != 0 {
+                    mstatus |= csr::MASK_MPIE;
+                } else {
+                    mstatus &= !csr::MASK_MPIE;
+                }
+                mstatus = (mstatus & !csr::MASK_MPP) | ((previous as u64) << 11);
+                mstatus &= !csr::MASK_MIE;
+                self.csr.store(csr::MSTATUS, mstatus);
+                self.csr.store(csr::MEPC, self.pc);
+                self.csr.store(csr::MCAUSE, cause);
+                self.csr.store(csr::MTVAL, value);
+                self.csr.load(csr::MTVEC)
+            }
+            PrivilegeMode::Supervisor => {
+                let mut sstatus = self.csr.load(csr::SSTATUS);
+                if sstatus & csr::MASK_SIE != 0 {
+                    sstatus |= csr::MASK_SPIE;
+                } else {
+                    sstatus &= !csr::MASK_SPIE;
+                }
+                if previous == PrivilegeMode::Supervisor {
+                    sstatus |= csr::MASK_SPP;
+                } else {
+                    sstatus &= !csr::MASK_SPP;
+                }
+                sstatus &= !csr::MASK_SIE;
+                self.csr.store(csr::SSTATUS, sstatus);
+                self.csr.store(csr::SEPC, self.pc);
+                self.csr.store(csr::SCAUSE, cause);
+                self.csr.store(csr::STVAL, value);
+                self.csr.load(csr::STVEC)
+            }
+            PrivilegeMode::User => unreachable!("traps are not delegated to user mode"),
+        };
+
+        self.privilege = target;
+        self.pc = trap_vector(vector, cause);
+        self.pc_written = true;
+    }
+
+    /// 恢复监督模式 trap 状态并返回 `SEPC`。
     pub fn supervisor_return(&mut self) {
         let mut sstatus = self.csr.load(csr::SSTATUS);
+        let target = if sstatus & csr::MASK_SPP != 0 {
+            PrivilegeMode::Supervisor
+        } else {
+            PrivilegeMode::User
+        };
         if sstatus & csr::MASK_SPIE != 0 {
             sstatus |= csr::MASK_SIE;
         } else {
@@ -366,30 +630,84 @@ impl Cpu {
         sstatus |= csr::MASK_SPIE;
         sstatus &= !csr::MASK_SPP;
         self.csr.store(csr::SSTATUS, sstatus);
-        self.pc = self.csr.load(csr::SEPC);
+        let mstatus = self.csr.load(csr::MSTATUS) & !csr::MASK_MPRV;
+        self.csr.store(csr::MSTATUS, mstatus);
+        self.privilege = target;
+        self.write_pc(self.csr.load(csr::SEPC));
+    }
+
+    /// 恢复机器模式 trap 状态并返回 `MEPC`。
+    pub fn machine_return(&mut self) {
+        let mut mstatus = self.csr.load(csr::MSTATUS);
+        let target = PrivilegeMode::from_encoding((mstatus & csr::MASK_MPP) >> 11)
+            .expect("mstatus.MPP contains only implemented privilege modes");
+        if mstatus & csr::MASK_MPIE != 0 {
+            mstatus |= csr::MASK_MIE;
+        } else {
+            mstatus &= !csr::MASK_MIE;
+        }
+        mstatus |= csr::MASK_MPIE;
+        mstatus &= !csr::MASK_MPP;
+        if target != PrivilegeMode::Machine {
+            mstatus &= !csr::MASK_MPRV;
+        }
+        self.csr.store(csr::MSTATUS, mstatus);
+        self.privilege = target;
+        self.write_pc(self.csr.load(csr::MEPC));
     }
 
     fn take_pending_interrupt(&mut self) -> bool {
-        // 全局 SIE 关闭时，单独的定时器/外部中断使能位不能触发 trap。
-        if self.csr.load(csr::SSTATUS) & csr::MASK_SIE == 0 {
-            return false;
-        }
+        self.refresh_pending_interrupts();
+        let pending = self.csr.load(csr::MIP) & self.csr.load(csr::MIE);
+        let mideleg = self.csr.load(csr::MIDELEG);
+        let mstatus = self.csr.load(csr::MSTATUS);
 
-        // 先检查定时器，固定当前单 hart 模型中多个中断同时到达时的优先顺序。
-        if self.timer_is_pending() && self.csr.load(csr::SIE) & csr::MASK_STIP != 0 {
-            self.enter_supervisor_trap((1 << 63) | 5, 0);
-            return true;
-        }
+        // 标准中断的默认优先级：MEI、MSI、MTI、SEI、SSI、STI。
+        for cause in INTERRUPT_PRIORITY {
+            let bit = 1 << cause;
+            if pending & bit == 0 {
+                continue;
+            }
 
-        let Some(scause) = self.bus.pending_interrupt() else {
-            return false;
-        };
-        if scause == (1 << 63) | 9 && self.csr.load(csr::SIE) & csr::MASK_SEIP != 0 {
-            self.enter_supervisor_trap(scause, 0);
+            let target = if mideleg & bit != 0 {
+                if self.privilege == PrivilegeMode::Machine
+                    || (self.privilege == PrivilegeMode::Supervisor && mstatus & csr::MASK_SIE == 0)
+                {
+                    continue;
+                }
+                PrivilegeMode::Supervisor
+            } else {
+                if self.privilege == PrivilegeMode::Machine && mstatus & csr::MASK_MIE == 0 {
+                    continue;
+                }
+                PrivilegeMode::Machine
+            };
+
+            self.enter_trap(target, INTERRUPT_FLAG | cause, 0);
             return true;
         }
 
         false
+    }
+
+    fn refresh_pending_interrupts(&mut self) {
+        let timer_driven = self.csr.load(csr::MENVCFG) & csr::MASK_STCE != 0;
+        let timer_pending = if timer_driven && self.timer_is_pending() {
+            csr::MASK_STIP
+        } else {
+            0
+        };
+
+        let device_pending = self
+            .bus
+            .pending_interrupt()
+            .filter(|cause| cause & INTERRUPT_FLAG != 0)
+            .map(|cause| cause & !INTERRUPT_FLAG)
+            .filter(|cause| *cause < 64)
+            .map_or(0, |cause| 1 << cause);
+
+        let hardware_pending = timer_pending | device_pending;
+        self.csr.update_pending(hardware_pending);
     }
 
     fn tick(&mut self) {
@@ -399,13 +717,24 @@ impl Cpu {
 
     fn timer_is_pending(&self) -> bool {
         let stimecmp = self.csr.load(csr::STIMECMP);
-        stimecmp != 0 && self.csr.load(csr::TIME) >= stimecmp
+        self.csr.load(csr::TIME) >= stimecmp
     }
 
     fn try_xv6_fast_path(&mut self) -> Result<bool, Exception> {
         let Some(accelerator) = self.xv6_accelerator else {
             return Ok(false);
         };
+        if self.privilege == PrivilegeMode::User {
+            return if accelerator.user_exec == Some(self.pc) {
+                self.fast_xv6_user_exec()
+            } else {
+                Ok(false)
+            };
+        }
+        if self.privilege != PrivilegeMode::Supervisor {
+            return Ok(false);
+        }
+
         // 仅匹配已从当前 ELF 解析出的函数入口，避免在普通指令中间误触发。
         match self.pc {
             pc if pc == accelerator.mycpu => self.fast_xv6_mycpu(),
@@ -424,7 +753,6 @@ impl Cpu {
             pc if pc == accelerator.uvmcopy => self.fast_xv6_uvmcopy(),
             pc if pc == accelerator.myproc => self.fast_xv6_myproc(),
             pc if pc == accelerator.wakeup => self.fast_xv6_wakeup(),
-            pc if accelerator.user_exec == Some(pc) => self.fast_xv6_user_exec(),
             _ => Ok(false),
         }
     }
@@ -846,13 +1174,12 @@ impl Cpu {
     }
 
     fn read_phys_u64(&mut self, addr: u64) -> Result<u64, Exception> {
-        self.bus.read(addr, 8)
+        // xv6 将可用物理内存恒等映射到内核地址空间；仍走普通访存路径以保留页权限和 PMP 检查。
+        self.read_u64(addr)
     }
 
     fn write_phys_u64(&mut self, addr: u64, value: u64) -> Result<(), Exception> {
-        // 总线写接口只接收 u32，物理 64 位值按小端低字在前拆分。
-        self.bus.write(addr, value as u32, 4)?;
-        self.bus.write(addr + 4, (value >> 32) as u32, 4)
+        self.write_u64(addr, value)
     }
 
     fn fast_xv6_wakeup(&mut self) -> Result<bool, Exception> {
@@ -875,8 +1202,8 @@ impl Cpu {
     }
 
     fn fast_xv6_user_exec(&mut self) -> Result<bool, Exception> {
-        // 该兼容路径只针对用户地址空间；内核同地址值不能被当作用户函数入口。
-        if self.pc >= crate::cfg::DRAM_BASE {
+        // 该兼容路径只针对用户模式；同一地址不能在更高特权级误触发。
+        if self.privilege != PrivilegeMode::User {
             return Ok(false);
         }
 
@@ -890,7 +1217,11 @@ impl Cpu {
             }
         };
 
-        if first_arg != 0 && self.translate(first_arg, MemoryAccess::Load).is_err() {
+        if first_arg != 0
+            && self
+                .translate_sized(first_arg, MemoryAccess::Load, 1)
+                .is_err()
+        {
             self.registers[10] = u64::MAX;
             self.fast_return();
             return Ok(true);
@@ -901,7 +1232,7 @@ impl Cpu {
 
     fn fast_return(&mut self) {
         self.registers[0] = 0;
-        self.pc = self.registers[1];
+        self.write_pc(self.registers[1]);
     }
 
     fn xv6_cpu_addr(&self) -> u64 {
@@ -911,34 +1242,48 @@ impl Cpu {
     }
 
     fn read_u8(&mut self, addr: u64) -> Result<u8, Exception> {
-        let addr = self.translate(addr, MemoryAccess::Load)?;
-        Ok(self.bus.read(addr, 1)? as u8)
+        let physical = self.translate_sized(addr, MemoryAccess::Load, 1)?;
+        self.bus
+            .read(physical, 1)
+            .map(|value| value as u8)
+            .map_err(|_| Exception::LoadAccessFault(addr))
     }
 
     fn read_u32(&mut self, addr: u64) -> Result<u32, Exception> {
-        let addr = self.translate(addr, MemoryAccess::Load)?;
-        Ok(self.bus.read(addr, 4)? as u32)
+        let physical = self.translate_sized(addr, MemoryAccess::Load, 4)?;
+        self.bus
+            .read(physical, 4)
+            .map(|value| value as u32)
+            .map_err(|_| Exception::LoadAccessFault(addr))
     }
 
     fn read_u64(&mut self, addr: u64) -> Result<u64, Exception> {
-        let addr = self.translate(addr, MemoryAccess::Load)?;
-        self.bus.read(addr, 8)
+        let physical = self.translate_sized(addr, MemoryAccess::Load, 8)?;
+        self.bus
+            .read(physical, 8)
+            .map_err(|_| Exception::LoadAccessFault(addr))
     }
 
     fn write_u8(&mut self, addr: u64, value: u8) -> Result<(), Exception> {
-        let addr = self.translate(addr, MemoryAccess::Store)?;
-        self.bus.write(addr, value as u32, 1)
+        let physical = self.translate_sized(addr, MemoryAccess::Store, 1)?;
+        self.bus
+            .write(physical, value as u32, 1)
+            .map_err(|_| Exception::StoreAMOAccessFault(addr))
     }
 
     fn write_u32(&mut self, addr: u64, value: u32) -> Result<(), Exception> {
-        let addr = self.translate(addr, MemoryAccess::Store)?;
-        self.bus.write(addr, value, 4)
+        let physical = self.translate_sized(addr, MemoryAccess::Store, 4)?;
+        self.bus
+            .write(physical, value, 4)
+            .map_err(|_| Exception::StoreAMOAccessFault(addr))
     }
 
     fn write_u64(&mut self, addr: u64, value: u64) -> Result<(), Exception> {
-        let addr = self.translate(addr, MemoryAccess::Store)?;
-        self.bus.write(addr, value as u32, 4)?;
-        self.bus.write(addr + 4, (value >> 32) as u32, 4)
+        let physical = self.translate_sized(addr, MemoryAccess::Store, 8)?;
+        self.bus
+            .write(physical, value as u32, 4)
+            .and_then(|()| self.bus.write(physical + 4, (value >> 32) as u32, 4))
+            .map_err(|_| Exception::StoreAMOAccessFault(addr))
     }
 }
 
@@ -947,6 +1292,42 @@ fn page_fault(access: MemoryAccess, addr: u64) -> Exception {
         MemoryAccess::Fetch => Exception::InstructionPageFault(addr),
         MemoryAccess::Load => Exception::LoadPageFault(addr),
         MemoryAccess::Store => Exception::StoreAMOPageFault(addr),
+    }
+}
+
+fn access_fault(access: MemoryAccess, addr: u64) -> Exception {
+    match access {
+        MemoryAccess::Fetch => Exception::InstructionAccessFault(addr),
+        MemoryAccess::Load => Exception::LoadAccessFault(addr),
+        MemoryAccess::Store => Exception::StoreAMOAccessFault(addr),
+    }
+}
+
+fn trap_vector(vector: u64, cause: u64) -> u64 {
+    let base = vector & !0b11;
+    if vector & 0b11 == 1 && cause & INTERRUPT_FLAG != 0 {
+        base.wrapping_add((cause & !INTERRUPT_FLAG).wrapping_mul(4))
+    } else {
+        base
+    }
+}
+
+fn pmp_range(previous: u64, address: u64, config: u8) -> Option<(u64, u64)> {
+    match (config >> PMP_CFG_ADDRESS_SHIFT) & PMP_CFG_ADDRESS_MASK {
+        PMP_ADDRESS_OFF => None,
+        PMP_ADDRESS_TOR => Some((previous << 2, address << 2)),
+        PMP_ADDRESS_NA4 => {
+            let start = address << 2;
+            Some((start, start.checked_add(4)?))
+        }
+        PMP_ADDRESS_NAPOT => {
+            let ones = address.trailing_ones();
+            let encoded_mask = if ones == 0 { 0 } else { (1u64 << ones) - 1 };
+            let start = (address & !encoded_mask) << 2;
+            let size = 1u64 << (ones + 3);
+            Some((start, start.checked_add(size)?))
+        }
+        _ => unreachable!(),
     }
 }
 
@@ -964,31 +1345,52 @@ fn xv6_pa_to_pte(pa: u64) -> u64 {
     (pa >> 12) << 10
 }
 
-fn exception_trap_info(exception: Exception) -> Option<(u64, u64)> {
-    // 在一个位置维护 Exception 到监督模式 scause/stval 的映射，避免各执行路径自行编码。
-    let info = match exception {
-        Exception::InstructionAddrMisaligned(addr) => (0, addr),
-        Exception::InstructionAccessFault(addr) => (1, addr),
-        Exception::IllegalInstruction(raw) => (2, raw),
-        Exception::Breakpoint(pc) => (3, pc),
-        Exception::LoadAccessMisaligned(addr) => (4, addr),
-        Exception::LoadAccessFault(addr) => (5, addr),
-        Exception::StoreAMOAddrMisaligned(addr) => (6, addr),
-        Exception::StoreAMOAccessFault(addr) => (7, addr),
-        Exception::EnvironmentCallFromUMode(_) => (8, 0),
-        Exception::EnvironmentCallFromSMode(_) => (9, 0),
-        Exception::EnvironmentCallFromMMode(_) => (11, 0),
-        Exception::InstructionPageFault(addr) => (12, addr),
-        Exception::LoadPageFault(addr) => (13, addr),
-        Exception::StoreAMOPageFault(addr) => (15, addr),
-    };
-    Some(info)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dram::Dram;
+
+    const BASE: u64 = 0x8000_0000;
+    const MEMORY_SIZE: usize = 0x10_000;
+
+    fn test_cpu() -> Cpu {
+        Cpu::with_reset_vector(
+            Box::new(Dram::with_layout(BASE, MEMORY_SIZE)),
+            BASE,
+            BASE + MEMORY_SIZE as u64,
+        )
+    }
+
+    fn execute_raw(cpu: &mut Cpu, raw: u32) {
+        cpu.pc = cpu.execute(u64::from(raw)).unwrap();
+    }
+
+    fn allow_all_memory(cpu: &mut Cpu) {
+        cpu.csr.store(csr::PMPADDR0, (1u64 << 54) - 1);
+        cpu.csr.store(csr::PMPCFG0, 0x0f);
+    }
+
+    fn write_phys_u64(cpu: &mut Cpu, addr: u64, value: u64) {
+        cpu.bus.write(addr, value as u32, 4).unwrap();
+        cpu.bus.write(addr + 4, (value >> 32) as u32, 4).unwrap();
+    }
+
+    fn install_sv39_mapping(cpu: &mut Cpu, virtual_addr: u64, physical: u64, flags: u64) -> u64 {
+        let root = BASE;
+        let level_1 = BASE + 0x1000;
+        let level_0 = BASE + 0x2000;
+        let vpn = [
+            (virtual_addr >> 12) & 0x1ff,
+            (virtual_addr >> 21) & 0x1ff,
+            (virtual_addr >> 30) & 0x1ff,
+        ];
+        write_phys_u64(cpu, root + vpn[2] * 8, xv6_pa_to_pte(level_1) | 1);
+        write_phys_u64(cpu, level_1 + vpn[1] * 8, xv6_pa_to_pte(level_0) | 1);
+        let leaf = level_0 + vpn[0] * 8;
+        write_phys_u64(cpu, leaf, xv6_pa_to_pte(physical) | flags | 1);
+        cpu.csr.store(csr::SATP, (8 << 60) | (root >> 12));
+        leaf
+    }
 
     #[test]
     fn run_reuses_step_and_stops_at_the_limit() {
@@ -1024,5 +1426,505 @@ mod tests {
         assert_eq!(cpu.registers[2], base + 16);
         assert_eq!(cpu.csr.load(csr::SATP), 0);
         assert_eq!(cpu.cycles, 0);
+        assert_eq!(cpu.privilege, PrivilegeMode::Machine);
+    }
+
+    #[test]
+    fn delegated_user_trap_and_sret_restore_supervisor_state() {
+        let mut cpu = test_cpu();
+        cpu.privilege = PrivilegeMode::User;
+        cpu.pc = 0x1000;
+        cpu.csr.store(csr::STVEC, 0x2001);
+        cpu.csr.store(csr::MEDELEG, 1 << 8);
+        cpu.csr.store(csr::SSTATUS, csr::MASK_SIE);
+
+        execute_raw(&mut cpu, 0x0000_0073);
+
+        assert_eq!(cpu.privilege, PrivilegeMode::Supervisor);
+        assert_eq!(cpu.pc, 0x2000);
+        assert_eq!(cpu.csr.load(csr::SEPC), 0x1000);
+        assert_eq!(cpu.csr.load(csr::SCAUSE), 8);
+        assert_eq!(cpu.csr.load(csr::STVAL), 0);
+        assert_eq!(cpu.csr.load(csr::SSTATUS) & csr::MASK_SIE, 0);
+        assert_ne!(cpu.csr.load(csr::SSTATUS) & csr::MASK_SPIE, 0);
+        assert_eq!(cpu.csr.load(csr::SSTATUS) & csr::MASK_SPP, 0);
+
+        cpu.csr.store(csr::SEPC, 0x1004);
+        cpu.csr
+            .store(csr::MSTATUS, cpu.csr.load(csr::MSTATUS) | csr::MASK_MPRV);
+        execute_raw(&mut cpu, 0x1020_0073);
+
+        assert_eq!(cpu.privilege, PrivilegeMode::User);
+        assert_eq!(cpu.pc, 0x1004);
+        assert_ne!(cpu.csr.load(csr::SSTATUS) & csr::MASK_SIE, 0);
+        assert_ne!(cpu.csr.load(csr::SSTATUS) & csr::MASK_SPIE, 0);
+        assert_eq!(cpu.csr.load(csr::MSTATUS) & csr::MASK_MPRV, 0);
+    }
+
+    #[test]
+    fn step_executes_mret_then_routes_a_user_ecall() {
+        let mut dram = Dram::with_layout(BASE, 16);
+        dram.load_bytes(
+            BASE,
+            &[
+                0x73, 0x00, 0x20, 0x30, // mret
+                0x73, 0x00, 0x00, 0x00, // ecall
+            ],
+        )
+        .unwrap();
+        let mut cpu = Cpu::with_reset_vector(Box::new(dram), BASE, BASE + 16);
+        allow_all_memory(&mut cpu);
+        cpu.csr.store(csr::MEPC, BASE + 4);
+        cpu.csr.store(csr::MEDELEG, 1 << 8);
+        cpu.csr.store(csr::STVEC, BASE + 8);
+
+        cpu.step().unwrap();
+        assert_eq!(cpu.privilege, PrivilegeMode::User);
+        assert_eq!(cpu.pc, BASE + 4);
+
+        cpu.step().unwrap();
+        assert_eq!(cpu.privilege, PrivilegeMode::Supervisor);
+        assert_eq!(cpu.pc, BASE + 8);
+        assert_eq!(cpu.csr.load(csr::SEPC), BASE + 4);
+        assert_eq!(cpu.csr.load(csr::SCAUSE), 8);
+    }
+
+    #[test]
+    fn delegated_supervisor_traps_return_to_supervisor_mode() {
+        let mut cpu = test_cpu();
+        cpu.privilege = PrivilegeMode::Supervisor;
+        cpu.pc = 0x1000;
+        cpu.csr.store(csr::STVEC, 0x2000);
+        cpu.csr.store(csr::MEDELEG, 1 << 9);
+
+        execute_raw(&mut cpu, 0x0000_0073);
+        assert_eq!(cpu.privilege, PrivilegeMode::Supervisor);
+        assert_eq!(cpu.csr.load(csr::SCAUSE), 9);
+        assert_ne!(cpu.csr.load(csr::SSTATUS) & csr::MASK_SPP, 0);
+
+        cpu.csr.store(csr::SEPC, 0x1004);
+        execute_raw(&mut cpu, 0x1020_0073);
+        assert_eq!(cpu.privilege, PrivilegeMode::Supervisor);
+        assert_eq!(cpu.pc, 0x1004);
+        assert_eq!(cpu.csr.load(csr::SSTATUS) & csr::MASK_SPP, 0);
+    }
+
+    #[test]
+    fn machine_trap_and_mret_restore_the_previous_mode() {
+        let mut cpu = test_cpu();
+        cpu.privilege = PrivilegeMode::Supervisor;
+        cpu.pc = 0x1800;
+        cpu.csr.store(csr::MTVEC, 0x3001);
+        cpu.csr.store(csr::MSTATUS, csr::MASK_MIE | csr::MASK_MPRV);
+
+        execute_raw(&mut cpu, 0x0000_0073);
+
+        assert_eq!(cpu.privilege, PrivilegeMode::Machine);
+        assert_eq!(cpu.pc, 0x3000);
+        assert_eq!(cpu.csr.load(csr::MEPC), 0x1800);
+        assert_eq!(cpu.csr.load(csr::MCAUSE), 9);
+        assert_eq!(
+            cpu.csr.load(csr::MSTATUS) & csr::MASK_MPP,
+            (PrivilegeMode::Supervisor as u64) << 11
+        );
+        assert_ne!(cpu.csr.load(csr::MSTATUS) & csr::MASK_MPIE, 0);
+        assert_eq!(cpu.csr.load(csr::MSTATUS) & csr::MASK_MIE, 0);
+
+        cpu.csr.store(csr::MEPC, 0x1804);
+        execute_raw(&mut cpu, 0x3020_0073);
+
+        assert_eq!(cpu.privilege, PrivilegeMode::Supervisor);
+        assert_eq!(cpu.pc, 0x1804);
+        assert_ne!(cpu.csr.load(csr::MSTATUS) & csr::MASK_MIE, 0);
+        assert_ne!(cpu.csr.load(csr::MSTATUS) & csr::MASK_MPIE, 0);
+        assert_eq!(cpu.csr.load(csr::MSTATUS) & csr::MASK_MPP, 0);
+        assert_eq!(cpu.csr.load(csr::MSTATUS) & csr::MASK_MPRV, 0);
+    }
+
+    #[test]
+    fn machine_mode_exceptions_are_never_delegated() {
+        let mut cpu = test_cpu();
+        cpu.pc = 0x1800;
+        cpu.csr.store(csr::MTVEC, 0x3000);
+        cpu.csr.store(csr::STVEC, 0x4000);
+        cpu.csr.store(csr::MEDELEG, 1 << 2);
+
+        execute_raw(&mut cpu, u32::MAX);
+
+        assert_eq!(cpu.privilege, PrivilegeMode::Machine);
+        assert_eq!(cpu.pc, 0x3000);
+        assert_eq!(cpu.csr.load(csr::MCAUSE), 2);
+        assert_eq!(cpu.csr.load(csr::MEPC), 0x1800);
+    }
+
+    #[test]
+    fn interrupts_obey_delegation_global_enable_and_vector_mode() {
+        let mut cpu = test_cpu();
+        cpu.privilege = PrivilegeMode::User;
+        cpu.pc = 0x1000;
+        cpu.csr.store(csr::STVEC, 0x2001);
+        cpu.csr.store(csr::MIDELEG, csr::MASK_SEIP);
+        cpu.csr.store(csr::MIE, csr::MASK_SEIP);
+        cpu.csr.store(csr::MIP, csr::MASK_SEIP);
+
+        assert!(cpu.take_pending_interrupt());
+        assert_eq!(cpu.privilege, PrivilegeMode::Supervisor);
+        assert_eq!(cpu.pc, 0x2000 + 4 * 9);
+        assert_eq!(cpu.csr.load(csr::SCAUSE), (1 << 63) | 9);
+
+        let mut cpu = test_cpu();
+        cpu.privilege = PrivilegeMode::Machine;
+        cpu.csr.store(csr::MIDELEG, csr::MASK_SEIP);
+        cpu.csr.store(csr::MIE, csr::MASK_SEIP);
+        cpu.csr.store(csr::MIP, csr::MASK_SEIP);
+        cpu.csr.store(csr::MSTATUS, csr::MASK_MIE);
+        assert!(!cpu.take_pending_interrupt());
+
+        let mut cpu = test_cpu();
+        cpu.privilege = PrivilegeMode::Supervisor;
+        cpu.csr.store(csr::MIDELEG, csr::MASK_SEIP);
+        cpu.csr.store(csr::MIE, csr::MASK_SEIP);
+        cpu.csr.store(csr::MIP, csr::MASK_SEIP);
+        assert!(!cpu.take_pending_interrupt());
+        cpu.csr.store(csr::SSTATUS, csr::MASK_SIE);
+        assert!(cpu.take_pending_interrupt());
+
+        let mut cpu = test_cpu();
+        cpu.csr.store(csr::MIE, csr::MASK_SEIP);
+        cpu.csr.store(csr::MIP, csr::MASK_SEIP);
+        assert!(!cpu.take_pending_interrupt());
+        cpu.csr.store(csr::MSTATUS, csr::MASK_MIE);
+        assert!(cpu.take_pending_interrupt());
+
+        let mut cpu = test_cpu();
+        cpu.privilege = PrivilegeMode::Supervisor;
+        cpu.pc = 0x4000;
+        cpu.csr.store(csr::MTVEC, 0x5001);
+        cpu.csr.store(csr::MIDELEG, 0);
+        cpu.csr.store(csr::MIE, csr::MASK_SEIP);
+        cpu.csr.store(csr::MIP, csr::MASK_SEIP);
+        assert!(cpu.take_pending_interrupt());
+        assert_eq!(cpu.privilege, PrivilegeMode::Machine);
+        assert_eq!(cpu.pc, 0x5000 + 4 * 9);
+        assert_eq!(cpu.csr.load(csr::MCAUSE), (1 << 63) | 9);
+    }
+
+    #[test]
+    fn csr_and_privileged_instruction_accesses_are_checked() {
+        let mut cpu = test_cpu();
+        cpu.privilege = PrivilegeMode::Supervisor;
+        assert!(!cpu.csr_access_allowed(csr::MSTATUS, false));
+        assert!(!cpu.csr_access_allowed(csr::TIME, false));
+        cpu.csr.store(csr::MCOUNTEREN, csr::MASK_COUNTEREN_TM);
+        assert!(cpu.csr_access_allowed(csr::TIME, false));
+        assert!(!cpu.csr_access_allowed(csr::TIME, true));
+        assert!(!cpu.csr_access_allowed(csr::STIMECMP, true));
+        cpu.csr.store(csr::MENVCFG, csr::MASK_STCE);
+        assert!(cpu.csr_access_allowed(csr::STIMECMP, true));
+        cpu.csr.store(csr::MSTATUS, csr::MASK_TVM | csr::MASK_TSR);
+        assert!(!cpu.csr_access_allowed(csr::SATP, false));
+
+        cpu.privilege = PrivilegeMode::User;
+        assert!(!cpu.csr_access_allowed(csr::TIME, false));
+        cpu.csr.store(csr::SCOUNTEREN, csr::MASK_COUNTEREN_TM);
+        assert!(cpu.csr_access_allowed(csr::TIME, false));
+        cpu.privilege = PrivilegeMode::Supervisor;
+
+        cpu.pc = 0x6000;
+        cpu.csr.store(csr::STVEC, 0x7000);
+        cpu.csr.store(csr::MEDELEG, 1 << 2);
+        execute_raw(&mut cpu, 0x1020_0073);
+        assert_eq!(cpu.privilege, PrivilegeMode::Supervisor);
+        assert_eq!(cpu.pc, 0x7000);
+        assert_eq!(cpu.csr.load(csr::SCAUSE), 2);
+        assert_eq!(cpu.csr.load(csr::STVAL), 0x1020_0073);
+
+        let mut cpu = test_cpu();
+        cpu.privilege = PrivilegeMode::User;
+        cpu.pc = 0x8000;
+        cpu.csr.store(csr::STVEC, 0x9000);
+        cpu.csr.store(csr::MEDELEG, 1 << 2);
+        let csrrs_mstatus = ((csr::MSTATUS as u32) << 20) | (2 << 12) | (1 << 7) | 0x73;
+        execute_raw(&mut cpu, csrrs_mstatus);
+        assert_eq!(cpu.privilege, PrivilegeMode::Supervisor);
+        assert_eq!(cpu.csr.load(csr::SCAUSE), 2);
+        assert_eq!(cpu.csr.load(csr::STVAL), u64::from(csrrs_mstatus));
+    }
+
+    #[test]
+    fn csr_instructions_reject_read_only_and_unimplemented_registers() {
+        let mut cpu = test_cpu();
+        cpu.csr.store(csr::TIME, 123);
+        let read_time = ((csr::TIME as u32) << 20) | (2 << 12) | (1 << 7) | 0x73;
+        execute_raw(&mut cpu, read_time);
+        assert_eq!(cpu.registers[1], 123);
+
+        cpu.csr.update_pending(csr::MASK_SEIP);
+        cpu.registers[2] = csr::MASK_SSIP;
+        let set_mip = ((csr::MIP as u32) << 20) | (2 << 15) | (2 << 12) | (1 << 7) | 0x73;
+        execute_raw(&mut cpu, set_mip);
+        assert_eq!(cpu.registers[1] & csr::MASK_SEIP, csr::MASK_SEIP);
+        cpu.csr.update_pending(0);
+        assert_eq!(cpu.csr.load(csr::MIP), csr::MASK_SSIP);
+
+        cpu.csr.store(csr::MTVEC, 0x7000);
+        let write_time = ((csr::TIME as u32) << 20) | (1 << 15) | (1 << 12) | 0x73;
+        execute_raw(&mut cpu, write_time);
+        assert_eq!(cpu.csr.load(csr::MCAUSE), 2);
+        assert_eq!(cpu.csr.load(csr::MTVAL), u64::from(write_time));
+
+        cpu.pc = 0x8000;
+        let unimplemented = (0x7ff << 20) | (2 << 12) | (1 << 7) | 0x73;
+        execute_raw(&mut cpu, unimplemented);
+        assert_eq!(cpu.csr.load(csr::MCAUSE), 2);
+        assert_eq!(cpu.csr.load(csr::MTVAL), u64::from(unimplemented));
+    }
+
+    #[test]
+    fn lower_modes_cannot_execute_higher_privilege_instructions() {
+        for raw in [0x1020_0073, 0x1050_0073, 0x1200_0073, 0x3020_0073] {
+            let mut cpu = test_cpu();
+            cpu.privilege = PrivilegeMode::User;
+            cpu.pc = 0x6000;
+            cpu.csr.store(csr::STVEC, 0x7000);
+            cpu.csr.store(csr::MEDELEG, 1 << 2);
+
+            execute_raw(&mut cpu, raw);
+
+            assert_eq!(cpu.privilege, PrivilegeMode::Supervisor);
+            assert_eq!(cpu.csr.load(csr::SCAUSE), 2);
+            assert_eq!(cpu.csr.load(csr::STVAL), u64::from(raw));
+        }
+    }
+
+    #[test]
+    fn pmp_enforces_permissions_for_lower_modes_and_locked_machine_access() {
+        let mut cpu = test_cpu();
+        cpu.privilege = PrivilegeMode::Supervisor;
+        assert_eq!(
+            cpu.translate_sized(BASE, MemoryAccess::Load, 8),
+            Err(Exception::LoadAccessFault(BASE))
+        );
+
+        cpu.csr.store(csr::PMPADDR0, (BASE + 0x1000) >> 2);
+        cpu.csr.store(csr::PMPCFG0, 0x0d);
+        assert_eq!(cpu.translate_sized(BASE, MemoryAccess::Load, 8), Ok(BASE));
+        assert_eq!(
+            cpu.translate_sized(BASE, MemoryAccess::Store, 8),
+            Err(Exception::StoreAMOAccessFault(BASE))
+        );
+        assert_eq!(
+            cpu.translate_sized(BASE + 0x1000, MemoryAccess::Load, 1),
+            Err(Exception::LoadAccessFault(BASE + 0x1000))
+        );
+
+        cpu.privilege = PrivilegeMode::Machine;
+        assert_eq!(cpu.translate_sized(BASE, MemoryAccess::Store, 8), Ok(BASE));
+        cpu.csr.store(csr::PMPCFG0, 0x8d);
+        assert_eq!(
+            cpu.translate_sized(BASE, MemoryAccess::Store, 8),
+            Err(Exception::StoreAMOAccessFault(BASE))
+        );
+    }
+
+    #[test]
+    fn pmp_uses_the_first_overlapping_entry_and_rejects_partial_matches() {
+        let mut cpu = test_cpu();
+        let eight_byte_napot = BASE >> 2;
+        let page_napot = (BASE >> 2) | 0x1ff;
+        cpu.csr.store(csr::PMPADDR0, eight_byte_napot);
+        cpu.csr.store(csr::PMPADDR0 + 1, page_napot);
+        cpu.csr.store(csr::PMPCFG0, 0x18 | (0x1f << 8));
+        cpu.privilege = PrivilegeMode::Supervisor;
+
+        assert_eq!(
+            cpu.translate_sized(BASE, MemoryAccess::Load, 1),
+            Err(Exception::LoadAccessFault(BASE))
+        );
+        assert_eq!(
+            cpu.translate_sized(BASE + 4, MemoryAccess::Load, 8),
+            Err(Exception::LoadAccessFault(BASE + 4))
+        );
+        assert_eq!(
+            cpu.translate_sized(BASE + 8, MemoryAccess::Load, 8),
+            Ok(BASE + 8)
+        );
+
+        let mut cpu = test_cpu();
+        cpu.csr.store(csr::PMPADDR0, BASE >> 2);
+        cpu.csr.store(csr::PMPADDR0 + 1, (BASE + 0x1000) >> 2);
+        cpu.csr.store(csr::PMPCFG0, 0x0d << 8);
+        cpu.privilege = PrivilegeMode::Supervisor;
+        assert_eq!(cpu.translate(BASE, MemoryAccess::Load), Ok(BASE));
+        assert_eq!(
+            cpu.translate(BASE - 1, MemoryAccess::Load),
+            Err(Exception::LoadAccessFault(BASE - 1))
+        );
+    }
+
+    #[test]
+    fn mprv_uses_mpp_for_data_but_not_instruction_fetches() {
+        const VIRTUAL: u64 = 0x4000;
+        const PHYSICAL: u64 = BASE + 0x4000;
+
+        let mut cpu = test_cpu();
+        allow_all_memory(&mut cpu);
+        install_sv39_mapping(
+            &mut cpu,
+            VIRTUAL,
+            PHYSICAL,
+            PTE_READ | PTE_USER | PTE_ACCESSED,
+        );
+        cpu.csr.store(
+            csr::MSTATUS,
+            csr::MASK_MPRV | ((PrivilegeMode::User as u64) << 11),
+        );
+
+        assert_eq!(cpu.translate(VIRTUAL, MemoryAccess::Load), Ok(PHYSICAL));
+        assert_eq!(cpu.translate(VIRTUAL, MemoryAccess::Fetch), Ok(VIRTUAL));
+    }
+
+    #[test]
+    fn timer_pending_state_is_visible_and_clears_when_sstc_is_disabled() {
+        let mut cpu = test_cpu();
+        cpu.csr.store(csr::MIDELEG, csr::MASK_STIP);
+        cpu.csr.store(csr::MENVCFG, csr::MASK_STCE);
+        cpu.csr.store(csr::STIMECMP, 10);
+        cpu.csr.store(csr::TIME, 10);
+
+        cpu.refresh_pending_interrupts();
+        assert_ne!(cpu.csr.load(csr::MIP) & csr::MASK_STIP, 0);
+        assert_ne!(cpu.csr.load(csr::SIP) & csr::MASK_STIP, 0);
+
+        cpu.csr.store(csr::MENVCFG, 0);
+        cpu.refresh_pending_interrupts();
+        assert_eq!(cpu.csr.load(csr::MIP) & csr::MASK_STIP, 0);
+    }
+
+    #[test]
+    fn fetch_failures_enter_machine_traps_with_instruction_causes() {
+        let mut cpu = test_cpu();
+        cpu.csr.store(csr::MTVEC, BASE);
+        cpu.pc = BASE + MEMORY_SIZE as u64;
+
+        cpu.step().unwrap();
+        assert_eq!(cpu.csr.load(csr::MCAUSE), 1);
+        assert_eq!(cpu.csr.load(csr::MTVAL), BASE + MEMORY_SIZE as u64);
+
+        cpu.pc = BASE + 1;
+        cpu.step().unwrap();
+        assert_eq!(cpu.csr.load(csr::MCAUSE), 0);
+        assert_eq!(cpu.csr.load(csr::MTVAL), BASE + 1);
+    }
+
+    #[test]
+    fn sv39_enforces_privilege_permissions_and_updates_ad_bits() {
+        const VIRTUAL: u64 = 0x4000;
+        const PHYSICAL: u64 = BASE + 0x4000;
+        const PTE_R: u64 = 1 << 1;
+        const PTE_W: u64 = 1 << 2;
+        const PTE_X: u64 = 1 << 3;
+        const PTE_U: u64 = 1 << 4;
+        const PTE_A: u64 = 1 << 6;
+        const PTE_D: u64 = 1 << 7;
+
+        let mut cpu = test_cpu();
+        allow_all_memory(&mut cpu);
+        let leaf = install_sv39_mapping(&mut cpu, VIRTUAL, PHYSICAL, PTE_R | PTE_W | PTE_U);
+        cpu.privilege = PrivilegeMode::User;
+
+        assert_eq!(
+            cpu.translate_sized(VIRTUAL, MemoryAccess::Load, 8),
+            Ok(PHYSICAL)
+        );
+        assert_ne!(cpu.bus.read(leaf, 8).unwrap() & PTE_A, 0);
+        assert_eq!(
+            cpu.translate_sized(VIRTUAL, MemoryAccess::Store, 8),
+            Ok(PHYSICAL)
+        );
+        assert_ne!(cpu.bus.read(leaf, 8).unwrap() & PTE_D, 0);
+
+        cpu.privilege = PrivilegeMode::Supervisor;
+        assert_eq!(
+            cpu.translate(VIRTUAL, MemoryAccess::Load),
+            Err(Exception::LoadPageFault(VIRTUAL))
+        );
+        cpu.csr.store(csr::SSTATUS, csr::MASK_SUM);
+        assert_eq!(cpu.translate(VIRTUAL, MemoryAccess::Load), Ok(PHYSICAL));
+        assert_eq!(
+            cpu.translate(VIRTUAL, MemoryAccess::Fetch),
+            Err(Exception::InstructionPageFault(VIRTUAL))
+        );
+
+        write_phys_u64(&mut cpu, leaf, xv6_pa_to_pte(PHYSICAL) | PTE_X | PTE_A | 1);
+        cpu.csr.store(csr::SSTATUS, 0);
+        assert_eq!(
+            cpu.translate(VIRTUAL, MemoryAccess::Load),
+            Err(Exception::LoadPageFault(VIRTUAL))
+        );
+        cpu.csr.store(csr::SSTATUS, csr::MASK_MXR);
+        assert_eq!(cpu.translate(VIRTUAL, MemoryAccess::Load), Ok(PHYSICAL));
+
+        cpu.privilege = PrivilegeMode::User;
+        let noncanonical = 1 << 39;
+        assert_eq!(
+            cpu.translate(noncanonical, MemoryAccess::Load),
+            Err(Exception::LoadPageFault(noncanonical))
+        );
+
+        cpu.privilege = PrivilegeMode::Machine;
+        assert_eq!(
+            cpu.translate(noncanonical, MemoryAccess::Load),
+            Ok(noncanonical)
+        );
+    }
+
+    #[test]
+    fn translated_pmp_faults_report_the_virtual_address() {
+        const VIRTUAL: u64 = 0x4000;
+        const PHYSICAL: u64 = BASE + 0x4000;
+
+        let mut cpu = test_cpu();
+        install_sv39_mapping(
+            &mut cpu,
+            VIRTUAL,
+            PHYSICAL,
+            PTE_READ | PTE_USER | PTE_ACCESSED,
+        );
+        cpu.csr.store(csr::PMPADDR0, (BASE + 0x3000) >> 2);
+        cpu.csr.store(csr::PMPCFG0, 0x0b);
+        cpu.privilege = PrivilegeMode::User;
+
+        assert_eq!(
+            cpu.translate(VIRTUAL, MemoryAccess::Load),
+            Err(Exception::LoadAccessFault(VIRTUAL))
+        );
+    }
+
+    #[test]
+    fn translated_bus_faults_report_the_virtual_address() {
+        const VIRTUAL: u64 = 0x4000;
+        const UNMAPPED_PHYSICAL: u64 = BASE + MEMORY_SIZE as u64 + 0x1000;
+
+        let mut cpu = test_cpu();
+        allow_all_memory(&mut cpu);
+        install_sv39_mapping(
+            &mut cpu,
+            VIRTUAL,
+            UNMAPPED_PHYSICAL,
+            PTE_READ | PTE_USER | PTE_ACCESSED,
+        );
+        cpu.privilege = PrivilegeMode::User;
+        cpu.pc = 0x6000;
+        cpu.registers[1] = VIRTUAL;
+        cpu.csr.store(csr::STVEC, 0x7000);
+        cpu.csr.store(csr::MEDELEG, 1 << 5);
+        let load = (1 << 15) | (3 << 12) | (2 << 7) | 0x03;
+
+        execute_raw(&mut cpu, load);
+
+        assert_eq!(cpu.privilege, PrivilegeMode::Supervisor);
+        assert_eq!(cpu.csr.load(csr::SCAUSE), 5);
+        assert_eq!(cpu.csr.load(csr::STVAL), VIRTUAL);
     }
 }

@@ -1,3 +1,3 @@
 # arvsim 仓库状态
 
-模块级分析已拆分到 [`repository-status/README.md`](./repository-status/README.md)。文档基于 2026-07-11 的当前工作树与提交 `008ae8b`，覆盖功能、实现状态、实现思路、对外接口、模块耦合、验证结果和仅包含未完成事项的优化路线。
+各模块的说明见 [`repository-status/README.md`](./repository-status/README.md)。文档基于 2026-07-12 的提交 `822629c` 和截至 2026-07-13 的工作区代码，内容包括模块功能、实现状态、公共接口、依赖关系、验证结果和未完成事项。

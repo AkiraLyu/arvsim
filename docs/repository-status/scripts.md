@@ -2,27 +2,27 @@
 
 ## `build_xv6_fixture.sh`
 
-检查宿主和 RISC-V 工具（包括 `nm`），克隆或更新 `mit-pdos/xv6-riscv` 的默认 `riscv` 分支，构建 kernel/fs.img，将 ELF 转为 flat binary，并生成 `fixture.env`。支持 `XV6_DIR`、`XV6_REPO`、`XV6_REF`、`TOOLPREFIX`。
+检查宿主工具和 RISC-V 工具链（包括 `nm`），克隆或更新 `mit-pdos/xv6-riscv` 的 `riscv` 分支，构建内核和 `fs.img`，将内核 ELF 转成裸二进制镜像，并生成 `fixture.env`。可通过 `XV6_DIR`、`XV6_REPO`、`XV6_REF` 和 `TOOLPREFIX` 覆盖默认值。
 
-状态：可用。CPU 加速地址会从构建出的 kernel ELF 动态解析，因此链接地址变化不会再误触发旧快速路径；但默认仍跟踪可变分支而非固定 commit，结构布局变化仍可能不兼容。已有 checkout 刷新失败时会静默复用旧版本。
+状态：可用。CPU 会从生成的内核 ELF 中读取加速地址，链接地址变化不再导致误触发。但脚本默认跟随可变分支，没有固定 xv6 提交版本；如果结构布局变化，仍可能不兼容。已有源码目录更新失败时，脚本只打印警告并继续使用旧版本。
 
 ## `run_testbench.sh`
 
-提供默认测试、先构建 fixture 后运行默认测试、运行 opt-in xv6 合同，以及“先构建再只运行 xv6 合同”四种模式。`--future-contracts` 是保留的历史参数名，当前先跑默认测试再运行 xv6 ignored 合同，但本身不构建 fixture；缺少构件会导致该模式失败。帮助文字把失败定义为回归或未满足合同。
+支持四种模式：运行默认测试；先生成 xv6 测试文件再运行默认测试；运行可选的 xv6 验收测试；先生成测试文件再只运行 xv6 验收测试。`--future-contracts` 是历史参数名，它会先运行默认测试，再运行标有 `#[ignore]` 的 xv6 测试，但不会生成测试文件，因此缺少文件时会失败。
 
 ## `run_xv6_cli.sh`
 
-确保 fixture 存在、构建 release 库，在 `target/testbench/generated` 写入临时 Rust runner，源码包含 `tests/support/mod.rs`，再用 `rustc` 链接 rlib。交互模式将 stdin 字节送入测试 UART，输出 guest UART；`Ctrl-]` 退出，`--boot-only` 到 shell prompt 后退出。
+确保 xv6 测试文件存在，并以 `release` 模式构建库，然后在 `target/testbench/generated` 生成临时 Rust 程序。该程序直接包含 `tests/support/mod.rs`，再由 `rustc` 链接编译后的 `arvsim` 库。交互模式把标准输入发送到测试 UART，并显示 xv6 的 UART 输出；按 `Ctrl-]` 退出，使用 `--boot-only` 时在出现 shell 提示符后退出。
 
-状态：能复用测试平台快速形成交互入口，但不是正式 CLI。它通过 shell here-doc 生成 Rust 源码、从 deps 中取第一个匹配 rlib，并依赖测试模块的非稳定接口；执行循环直接调用 `machine.cpu.step()`，未来 `Machine` 增加平台 tick 时会被绕过。
+状态：可以快速启动交互式 xv6，但不是正式命令行功能。脚本通过内嵌文本生成 Rust 源码，从 `deps` 目录取第一个匹配的编译库，并直接依赖测试模块的内部接口。执行循环调用 `machine.cpu.step()`；以后若由 `Machine` 统一推进设备，该脚本会跳过相应逻辑。
 
-## 对外接口与耦合
+## 命令与依赖
 
 - `scripts/run_testbench.sh [--with-xv6-fixture|--future-contracts|--xv6-contracts]`
 - `scripts/run_xv6_cli.sh [--build-fixture] [--boot-only]`
-- 强依赖 Bash、Git、Make、GCC、Perl、RISC-V binutils/GCC、网络和上游 xv6。
-- 交互脚本还依赖 `cargo/rustc/find/stty` 和测试支撑源码布局。
+- 依赖 Bash、Git、Make、GCC、Perl、RISC-V binutils/GCC、网络和上游 xv6。
+- 交互脚本还依赖 `cargo/rustc/find/stty`，并依赖测试辅助模块当前的源码布局。
 
-## 优化方向
+## 改进建议
 
-固定并校验 xv6 commit/构件哈希；将 runner 做成 Cargo binary/example 并只调用 `Machine` 运行接口；由正式平台构建器供 CLI 与测试共用；自动发现 tool prefix；重命名历史 `--future-contracts` 并明确 skip/fail 语义；在 CI 中缓存 fixture 并分离 smoke/nightly 测试档位。
+固定并校验 xv6 提交版本与测试文件哈希；把临时运行程序改成 Cargo 可执行目标或示例程序，并只使用 `Machine` 的运行接口；让命令行程序和测试共用正式平台构建器；自动查找工具链前缀；重命名 `--future-contracts`，明确区分测试跳过和失败；在持续集成中缓存测试文件，并分开运行快速测试和定时长测。
