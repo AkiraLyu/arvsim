@@ -197,7 +197,7 @@ mod tests {
             Err(Exception::LoadAccessFault(addr))
         }
 
-        fn write(&mut self, addr: u64, _value: u32, _size: usize) -> Result<(), Exception> {
+        fn write(&mut self, addr: u64, _value: u64, _size: usize) -> Result<(), Exception> {
             Err(Exception::StoreAMOAccessFault(addr))
         }
 

@@ -37,10 +37,41 @@ fn testbench_uart_model_captures_16550_transmit_bytes() {
     let state = bus.state();
     let mut device = bus;
 
-    device.write(cfg::UART_BASE, b'O' as u32, 1).unwrap();
-    device.write(cfg::UART_BASE, b'K' as u32, 1).unwrap();
+    device.write(cfg::UART_BASE, u64::from(b'O'), 1).unwrap();
+    device.write(cfg::UART_BASE, u64::from(b'K'), 1).unwrap();
 
     assert_eq!(state.borrow().uart_output_string(), "OK");
+}
+
+#[test]
+fn testbench_bus_rejects_invalid_and_partial_accesses() {
+    let mut bus = support::TestBus::rv64_smoke();
+    let state = bus.state();
+
+    for size in [0, 3, 9, usize::MAX] {
+        assert_eq!(
+            bus.read(cfg::DRAM_BASE, size),
+            Err(arvsim::trap::Exception::LoadAccessFault(cfg::DRAM_BASE))
+        );
+        assert_eq!(
+            bus.write(cfg::DRAM_BASE, u64::MAX, size),
+            Err(arvsim::trap::Exception::StoreAMOAccessFault(cfg::DRAM_BASE))
+        );
+    }
+
+    let value = 0x0123_4567_89ab_cdef;
+    bus.write(cfg::DRAM_BASE, value, 8).unwrap();
+    assert_eq!(bus.read(cfg::DRAM_BASE, 8).unwrap(), value);
+    assert_eq!(
+        bus.write(cfg::UART_BASE, value, 8),
+        Err(arvsim::trap::Exception::StoreAMOAccessFault(cfg::UART_BASE))
+    );
+    assert!(state.borrow().uart_output_string().is_empty());
+    assert!(state.borrow().mmio_log().is_empty());
+    assert_eq!(
+        bus.read(u64::MAX, 8),
+        Err(arvsim::trap::Exception::LoadAccessFault(u64::MAX))
+    );
 }
 
 #[test]

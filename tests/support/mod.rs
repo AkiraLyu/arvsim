@@ -148,7 +148,8 @@ impl TestBusState {
     fn ram_offset(&self, addr: u64, size: usize) -> Result<usize, Exception> {
         let offset = addr
             .checked_sub(cfg::DRAM_BASE)
-            .ok_or(Exception::LoadAccessFault(addr))? as usize;
+            .and_then(|offset| usize::try_from(offset).ok())
+            .ok_or(Exception::LoadAccessFault(addr))?;
         let end = offset
             .checked_add(size)
             .ok_or(Exception::LoadAccessFault(addr))?;
@@ -160,6 +161,9 @@ impl TestBusState {
     }
 
     fn read_ram(&self, addr: u64, size: usize) -> Result<u64, Exception> {
+        if !matches!(size, 1 | 2 | 4 | 8) {
+            return Err(Exception::LoadAccessFault(addr));
+        }
         let offset = self.ram_offset(addr, size)?;
         let mut value = 0u64;
         for i in 0..size {
@@ -169,6 +173,9 @@ impl TestBusState {
     }
 
     fn write_ram(&mut self, addr: u64, value: u64, size: usize) -> Result<(), Exception> {
+        if !matches!(size, 1 | 2 | 4 | 8) {
+            return Err(Exception::StoreAMOAccessFault(addr));
+        }
         let offset = self.ram_offset(addr, size)?;
         for i in 0..size {
             self.ram[offset + i] = ((value >> (i * 8)) & 0xff) as u8;
@@ -182,22 +189,26 @@ impl TestBusState {
         addr: u64,
         len: usize,
     ) -> Result<(), Exception> {
-        if disk_offset + len > self.disk.len() {
+        let disk_end = disk_offset
+            .checked_add(len)
+            .ok_or(Exception::LoadAccessFault(addr))?;
+        if disk_end > self.disk.len() {
             return Err(Exception::LoadAccessFault(addr));
         }
         let ram_offset = self.ram_offset(addr, len)?;
-        self.ram[ram_offset..ram_offset + len]
-            .copy_from_slice(&self.disk[disk_offset..disk_offset + len]);
+        self.ram[ram_offset..ram_offset + len].copy_from_slice(&self.disk[disk_offset..disk_end]);
         Ok(())
     }
 
     fn copy_to_disk(&mut self, addr: u64, disk_offset: usize, len: usize) -> Result<(), Exception> {
         let ram_offset = self.ram_offset(addr, len)?;
-        if disk_offset + len > self.disk.len() {
-            self.disk.resize(disk_offset + len, 0);
+        let disk_end = disk_offset
+            .checked_add(len)
+            .ok_or(Exception::StoreAMOAccessFault(addr))?;
+        if disk_end > self.disk.len() {
+            self.disk.resize(disk_end, 0);
         }
-        self.disk[disk_offset..disk_offset + len]
-            .copy_from_slice(&self.ram[ram_offset..ram_offset + len]);
+        self.disk[disk_offset..disk_end].copy_from_slice(&self.ram[ram_offset..ram_offset + len]);
         Ok(())
     }
 }
@@ -245,13 +256,24 @@ impl TestBus {
         Ok(())
     }
 
+    const fn valid_access_size(size: usize) -> bool {
+        matches!(size, 1 | 2 | 4 | 8)
+    }
+
     fn dram_offset(state: &TestBusState, addr: u64, size: usize) -> Option<usize> {
-        let offset = addr.checked_sub(cfg::DRAM_BASE)? as usize;
+        if !Self::valid_access_size(size) {
+            return None;
+        }
+        addr.checked_add(u64::try_from(size).ok()?)?;
+        let offset = usize::try_from(addr.checked_sub(cfg::DRAM_BASE)?).ok()?;
         let end = offset.checked_add(size)?;
         (end <= state.ram.len()).then_some(offset)
     }
 
     fn read_uart(state: &mut TestBusState, addr: u64, size: usize) -> Result<u64, Exception> {
+        if size != 1 {
+            return Err(Exception::LoadAccessFault(addr));
+        }
         let offset = addr - cfg::UART_BASE;
         state.mmio_log.push(MmioAccess {
             kind: MmioAccessKind::Read,
@@ -283,14 +305,17 @@ impl TestBus {
     fn write_uart(
         state: &mut TestBusState,
         addr: u64,
-        value: u32,
+        value: u64,
         size: usize,
     ) -> Result<(), Exception> {
+        if size != 1 {
+            return Err(Exception::StoreAMOAccessFault(addr));
+        }
         let offset = addr - cfg::UART_BASE;
         state.mmio_log.push(MmioAccess {
             kind: MmioAccessKind::Write,
             addr,
-            value: value as u64,
+            value,
             size,
         });
 
@@ -303,9 +328,13 @@ impl TestBus {
     }
 
     fn plic_offset(addr: u64, size: usize) -> Option<usize> {
-        let offset = addr.checked_sub(PLIC_BASE)? as usize;
+        if !matches!(size, 1 | 2 | 4) {
+            return None;
+        }
+        addr.checked_add(u64::try_from(size).ok()?)?;
+        let offset = usize::try_from(addr.checked_sub(PLIC_BASE)?).ok()?;
         let end = offset.checked_add(size)?;
-        (end <= PLIC_SIZE as usize).then_some(offset)
+        (end <= PLIC_SIZE as usize && (offset & 0x3) + size <= 4).then_some(offset)
     }
 
     fn read_plic(state: &mut TestBusState, addr: u64, size: usize) -> Result<u64, Exception> {
@@ -327,19 +356,20 @@ impl TestBus {
     fn write_plic(
         state: &mut TestBusState,
         addr: u64,
-        value: u32,
+        value: u64,
         size: usize,
     ) -> Result<(), Exception> {
         state.mmio_log.push(MmioAccess {
             kind: MmioAccessKind::Write,
             addr,
-            value: value as u64,
+            value,
             size,
         });
         let offset = Self::plic_offset(addr, size).ok_or(Exception::StoreAMOAccessFault(addr))?;
         if offset == 0x201004 {
             return Ok(());
         }
+        let value = value as u32;
         let shift = (offset & 0x3) * 8;
         let mask = if size == 4 {
             u32::MAX
@@ -369,7 +399,11 @@ impl TestBus {
     }
 
     fn virtio_offset(addr: u64, size: usize) -> Option<usize> {
-        let offset = addr.checked_sub(VIRTIO_BASE)? as usize;
+        if size != 4 {
+            return None;
+        }
+        addr.checked_add(4)?;
+        let offset = usize::try_from(addr.checked_sub(VIRTIO_BASE)?).ok()?;
         let end = offset.checked_add(size)?;
         (end <= VIRTIO_SIZE as usize).then_some(offset)
     }
@@ -402,16 +436,17 @@ impl TestBus {
     fn write_virtio(
         state: &mut TestBusState,
         addr: u64,
-        value: u32,
+        value: u64,
         size: usize,
     ) -> Result<(), Exception> {
         let offset = Self::virtio_offset(addr, size).ok_or(Exception::StoreAMOAccessFault(addr))?;
         state.mmio_log.push(MmioAccess {
             kind: MmioAccessKind::Write,
             addr,
-            value: value as u64,
+            value,
             size,
         });
+        let value = value as u32;
         match offset {
             0x020 => state.virtio.driver_features = value,
             0x030 => state.virtio.queue_sel = value,
@@ -523,6 +558,9 @@ impl TestBus {
 
 impl MemDevice for TestBus {
     fn read(&mut self, addr: u64, size: usize) -> Result<u64, Exception> {
+        if !Self::valid_access_size(size) {
+            return Err(Exception::LoadAccessFault(addr));
+        }
         let mut state = self.state.borrow_mut();
         if state.uart_tx_busy_addr == Some(addr) && size == 4 {
             return Ok(0);
@@ -554,7 +592,10 @@ impl MemDevice for TestBus {
         Err(Exception::LoadAccessFault(addr))
     }
 
-    fn write(&mut self, addr: u64, value: u32, size: usize) -> Result<(), Exception> {
+    fn write(&mut self, addr: u64, value: u64, size: usize) -> Result<(), Exception> {
+        if !Self::valid_access_size(size) {
+            return Err(Exception::StoreAMOAccessFault(addr));
+        }
         let mut state = self.state.borrow_mut();
         if state.uart_tx_busy_addr == Some(addr) && size == 4 {
             return Ok(());
@@ -579,7 +620,7 @@ impl MemDevice for TestBus {
         state.mmio_log.push(MmioAccess {
             kind: MmioAccessKind::Write,
             addr,
-            value: value as u64,
+            value,
             size,
         });
         Err(Exception::StoreAMOAccessFault(addr))

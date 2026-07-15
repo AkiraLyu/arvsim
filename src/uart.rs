@@ -3,7 +3,10 @@
 //! 该模型只提供当前命令行运行所需的发送路径和固定状态：接收缓冲始终为空，
 //! 发送保持就绪，写 THR 会立即输出到宿主标准输出。测试平台使用另一套可注入输入的 UART 模型。
 
-use crate::{bus::MemDevice, trap::Exception};
+use crate::{
+    bus::{MemDevice, valid_access_size},
+    trap::Exception,
+};
 
 /// 以 `base` 为 MMIO 起点的简化 UART。
 pub struct Uart {
@@ -18,8 +21,13 @@ impl Uart {
 }
 
 impl MemDevice for Uart {
-    fn read(&mut self, addr: u64, _size: usize) -> Result<u64, Exception> {
-        let offset = addr - self.base;
+    fn read(&mut self, addr: u64, size: usize) -> Result<u64, Exception> {
+        if !valid_access_size(size) || size != 1 {
+            return Err(Exception::LoadAccessFault(addr));
+        }
+        let offset = addr
+            .checked_sub(self.base)
+            .ok_or(Exception::LoadAccessFault(addr))?;
         match offset {
             0x00 => {
                 // RBR (Receiver Buffer Register)，简化版始终返回 0
@@ -33,8 +41,13 @@ impl MemDevice for Uart {
         }
     }
 
-    fn write(&mut self, addr: u64, value: u32, _size: usize) -> Result<(), Exception> {
-        let offset = addr - self.base;
+    fn write(&mut self, addr: u64, value: u64, size: usize) -> Result<(), Exception> {
+        if !valid_access_size(size) || size != 1 {
+            return Err(Exception::StoreAMOAccessFault(addr));
+        }
+        let offset = addr
+            .checked_sub(self.base)
+            .ok_or(Exception::StoreAMOAccessFault(addr))?;
         match offset {
             0x00 => {
                 // THR (Transmit Holding Register)，把字节输出
@@ -63,7 +76,7 @@ mod tests {
         // 读取 Line Status Register (LSR)
         let lsr_addr = UART_BASE_ADDR + 0x05;
         // 0x20 (bit 5) 表示 Transmitter Holding Register is empty
-        match uart.read(lsr_addr, 8) {
+        match uart.read(lsr_addr, 1) {
             Ok(value) => assert_eq!(value, 0x20),
             Err(_) => panic!("Reading LSR should not fail"),
         }
@@ -74,7 +87,7 @@ mod tests {
         let mut uart = Uart::new(UART_BASE_ADDR);
         // 读取 Receiver Buffer Register (RBR)
         let rbr_addr = UART_BASE_ADDR;
-        match uart.read(rbr_addr, 8) {
+        match uart.read(rbr_addr, 1) {
             Ok(value) => assert_eq!(value, 0),
             Err(_) => panic!("Reading RBR should not fail"),
         }
@@ -86,7 +99,29 @@ mod tests {
         // 写入 Transmitter Holding Register (THR)
         let thr_addr = UART_BASE_ADDR;
         // 写入字符 'A' (ASCII 65)
-        let result = uart.write(thr_addr, 65, 8);
+        let result = uart.write(thr_addr, 65, 1);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn invalid_widths_and_addresses_are_rejected() {
+        let mut uart = Uart::new(UART_BASE_ADDR);
+
+        assert_eq!(
+            uart.read(UART_BASE_ADDR, 0),
+            Err(Exception::LoadAccessFault(UART_BASE_ADDR))
+        );
+        assert_eq!(
+            uart.read(UART_BASE_ADDR, 4),
+            Err(Exception::LoadAccessFault(UART_BASE_ADDR))
+        );
+        assert_eq!(
+            uart.write(UART_BASE_ADDR, 65, 8),
+            Err(Exception::StoreAMOAccessFault(UART_BASE_ADDR))
+        );
+        assert_eq!(
+            uart.write(UART_BASE_ADDR - 1, 65, 1),
+            Err(Exception::StoreAMOAccessFault(UART_BASE_ADDR - 1))
+        );
     }
 }

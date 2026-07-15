@@ -26,6 +26,7 @@ pub struct Cpu {
     reset_vector: u64,
     initial_sp: u64,
     pc_written: bool,
+    reservation: Option<(u64, usize)>,
     xv6_accelerator: Option<Xv6Accelerator>,
 }
 
@@ -176,6 +177,7 @@ impl Cpu {
             reset_vector,
             initial_sp,
             pc_written: false,
+            reservation: None,
             xv6_accelerator: None,
         };
         cpu.registers[2] = initial_sp;
@@ -191,6 +193,7 @@ impl Cpu {
         self.privilege = PrivilegeMode::Machine;
         self.cycles = 0;
         self.pc_written = false;
+        self.reservation = None;
     }
 
     /// 启用与当前 xv6 镜像匹配的快速路径。
@@ -266,18 +269,33 @@ impl Cpu {
         }
     }
 
-    /// 翻译当前 PC，并从物理总线读取一个 32 位取指窗口。
-    ///
-    /// 压缩指令只使用低 16 位；统一读取 4 字节可让译码入口保持单一格式。
+    /// 翻译当前 PC，并按指令编码实际需要的长度取指。
     fn fetch(&mut self) -> Result<u64, Exception> {
         if self.pc & 1 != 0 {
             return Err(Exception::InstructionAddrMisaligned(self.pc));
         }
-        let addr = self.translate_sized(self.pc, MemoryAccess::Fetch, 4)?;
-        self.bus
-            .read(addr, 4)
-            .map_err(|_| Exception::InstructionAccessFault(self.pc))
+
+        let low = self.fetch_halfword(self.pc)?;
+        if low & 0b11 != 0b11 {
+            return Ok(u64::from(low));
+        }
+
+        let upper_addr = self
+            .pc
+            .checked_add(2)
+            .ok_or(Exception::InstructionAccessFault(self.pc))?;
+        let high = self.fetch_halfword(upper_addr)?;
+        Ok(u64::from(low) | (u64::from(high) << 16))
     }
+
+    fn fetch_halfword(&mut self, virtual_addr: u64) -> Result<u16, Exception> {
+        let addr = self.translate_sized(virtual_addr, MemoryAccess::Fetch, 2)?;
+        self.bus
+            .read(addr, 2)
+            .map(|value| value as u16)
+            .map_err(|_| Exception::InstructionAccessFault(virtual_addr))
+    }
+
     /// 译码并执行一条指令，返回提交后的 PC。
     fn execute(&mut self, instruction: u64) -> Result<u64, Exception> {
         let old_pc = self.pc;
@@ -318,6 +336,18 @@ impl Cpu {
     pub(crate) fn write_pc(&mut self, pc: u64) {
         self.pc = pc;
         self.pc_written = true;
+    }
+
+    pub(crate) fn set_reservation(&mut self, addr: u64, size: usize) {
+        self.reservation = Some((addr, size));
+    }
+
+    pub(crate) fn take_reservation(&mut self) -> Option<(u64, usize)> {
+        self.reservation.take()
+    }
+
+    pub(crate) fn clear_reservation(&mut self) {
+        self.reservation = None;
     }
 
     /// 检查当前特权级能否按指定方式访问 CSR。
@@ -473,7 +503,7 @@ impl Cpu {
                     self.check_pmp(pte_addr, 8, PrivilegeMode::Supervisor, MemoryAccess::Store)
                         .map_err(|_| access_fault(access, addr))?;
                     self.bus
-                        .write(pte_addr, updated as u32, 4)
+                        .write(pte_addr, updated, 4)
                         .map_err(|_| access_fault(access, addr))?;
                 }
 
@@ -570,6 +600,7 @@ impl Cpu {
     }
 
     fn enter_trap(&mut self, target: PrivilegeMode, cause: u64, value: u64) {
+        self.clear_reservation();
         let previous = self.privilege;
         let vector = match target {
             PrivilegeMode::Machine => {
@@ -1266,23 +1297,25 @@ impl Cpu {
 
     fn write_u8(&mut self, addr: u64, value: u8) -> Result<(), Exception> {
         let physical = self.translate_sized(addr, MemoryAccess::Store, 1)?;
+        self.clear_reservation();
         self.bus
-            .write(physical, value as u32, 1)
+            .write(physical, u64::from(value), 1)
             .map_err(|_| Exception::StoreAMOAccessFault(addr))
     }
 
     fn write_u32(&mut self, addr: u64, value: u32) -> Result<(), Exception> {
         let physical = self.translate_sized(addr, MemoryAccess::Store, 4)?;
+        self.clear_reservation();
         self.bus
-            .write(physical, value, 4)
+            .write(physical, u64::from(value), 4)
             .map_err(|_| Exception::StoreAMOAccessFault(addr))
     }
 
     fn write_u64(&mut self, addr: u64, value: u64) -> Result<(), Exception> {
         let physical = self.translate_sized(addr, MemoryAccess::Store, 8)?;
+        self.clear_reservation();
         self.bus
-            .write(physical, value as u32, 4)
-            .and_then(|()| self.bus.write(physical + 4, (value >> 32) as u32, 4))
+            .write(physical, value, 8)
             .map_err(|_| Exception::StoreAMOAccessFault(addr))
     }
 }
@@ -1365,14 +1398,40 @@ mod tests {
         cpu.pc = cpu.execute(u64::from(raw)).unwrap();
     }
 
+    fn load_raw(funct3: u32, rd: u32, rs1: u32) -> u32 {
+        (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0x03
+    }
+
+    fn store_raw(funct3: u32, rs1: u32, rs2: u32) -> u32 {
+        (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | 0x23
+    }
+
+    fn amo_raw(funct5: u32, funct3: u32, rd: u32, rs1: u32, rs2: u32) -> u32 {
+        (funct5 << 27) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | 0x2f
+    }
+
+    struct RejectingWriteDevice {
+        writes: std::rc::Rc<std::cell::RefCell<Vec<(u64, u64, usize)>>>,
+    }
+
+    impl crate::bus::MemDevice for RejectingWriteDevice {
+        fn read(&mut self, _addr: u64, _size: usize) -> Result<u64, Exception> {
+            Ok(0)
+        }
+
+        fn write(&mut self, addr: u64, value: u64, size: usize) -> Result<(), Exception> {
+            self.writes.borrow_mut().push((addr, value, size));
+            Err(Exception::StoreAMOAccessFault(addr))
+        }
+    }
+
     fn allow_all_memory(cpu: &mut Cpu) {
         cpu.csr.store(csr::PMPADDR0, (1u64 << 54) - 1);
         cpu.csr.store(csr::PMPCFG0, 0x0f);
     }
 
     fn write_phys_u64(cpu: &mut Cpu, addr: u64, value: u64) {
-        cpu.bus.write(addr, value as u32, 4).unwrap();
-        cpu.bus.write(addr + 4, (value >> 32) as u32, 4).unwrap();
+        cpu.bus.write(addr, value, 8).unwrap();
     }
 
     fn install_sv39_mapping(cpu: &mut Cpu, virtual_addr: u64, physical: u64, flags: u64) -> u64 {
@@ -1427,6 +1486,110 @@ mod tests {
         assert_eq!(cpu.csr.load(csr::SATP), 0);
         assert_eq!(cpu.cycles, 0);
         assert_eq!(cpu.privilege, PrivilegeMode::Machine);
+    }
+
+    #[test]
+    fn fetch_uses_the_encoded_instruction_length() {
+        let mut compressed = Dram::with_layout(BASE, 2);
+        compressed.load_bytes(BASE, &[0x01, 0x00]).unwrap(); // c.nop
+        let mut cpu = Cpu::with_reset_vector(Box::new(compressed), BASE, BASE + 2);
+
+        cpu.step().unwrap();
+
+        assert_eq!(cpu.pc, BASE + 2);
+
+        let mut truncated = Dram::with_layout(BASE, 2);
+        truncated.load_bytes(BASE, &[0x93, 0x0f]).unwrap(); // low half of a 32-bit addi
+        let mut cpu = Cpu::with_reset_vector(Box::new(truncated), BASE, BASE + 2);
+        cpu.csr.store(csr::MTVEC, BASE);
+
+        cpu.step().unwrap();
+
+        assert_eq!(cpu.pc, BASE);
+        assert_eq!(cpu.csr.load(csr::MEPC), BASE);
+        assert_eq!(cpu.csr.load(csr::MCAUSE), 1);
+        assert_eq!(cpu.csr.load(csr::MTVAL), BASE + 2);
+    }
+
+    #[test]
+    fn misaligned_data_accesses_raise_architectural_exceptions() {
+        let cases = [
+            (load_raw(3, 3, 1), 4),      // ld
+            (store_raw(3, 1, 2), 6),     // sd
+            (amo_raw(0, 3, 3, 1, 2), 6), // amoadd.d
+            (0x6000, 4),                 // c.ld x8, 0(x8)
+            (0xe000, 6),                 // c.sd x8, 0(x8)
+        ];
+
+        for (raw, cause) in cases {
+            let mut cpu = test_cpu();
+            let addr = BASE + 1;
+            cpu.registers[1] = addr;
+            cpu.registers[8] = addr;
+            cpu.csr.store(csr::MTVEC, BASE + 0x8000);
+
+            execute_raw(&mut cpu, raw);
+
+            assert_eq!(cpu.csr.load(csr::MCAUSE), cause, "raw={raw:#x}");
+            assert_eq!(cpu.csr.load(csr::MTVAL), addr, "raw={raw:#x}");
+            assert_eq!(cpu.csr.load(csr::MEPC), BASE, "raw={raw:#x}");
+        }
+    }
+
+    #[test]
+    fn lr_sc_tracks_and_consumes_the_reservation() {
+        let mut cpu = test_cpu();
+        let addr = BASE + 0x400;
+        let initial = 0x0123_4567_89ab_cdef;
+        let replacement = 0xfedc_ba98_7654_3210;
+        cpu.bus.write(addr, initial, 8).unwrap();
+        cpu.registers[1] = addr;
+        cpu.registers[2] = replacement;
+        let lr_d = amo_raw(0x02, 3, 3, 1, 0);
+        let sc_d = amo_raw(0x03, 3, 4, 1, 2);
+
+        execute_raw(&mut cpu, lr_d);
+        assert_eq!(cpu.registers[3], initial);
+
+        execute_raw(&mut cpu, sc_d);
+        assert_eq!(cpu.registers[4], 0);
+        assert_eq!(cpu.bus.read(addr, 8).unwrap(), replacement);
+
+        cpu.registers[2] = 0xaaaa_bbbb_cccc_dddd;
+        execute_raw(&mut cpu, sc_d);
+        assert_eq!(cpu.registers[4], 1);
+        assert_eq!(cpu.bus.read(addr, 8).unwrap(), replacement);
+
+        execute_raw(&mut cpu, lr_d);
+        cpu.registers[5] = addr + 8;
+        execute_raw(&mut cpu, store_raw(3, 5, 2));
+        execute_raw(&mut cpu, sc_d);
+        assert_eq!(cpu.registers[4], 1);
+        assert_eq!(cpu.bus.read(addr, 8).unwrap(), replacement);
+    }
+
+    #[test]
+    fn eight_byte_stores_and_amos_use_one_device_transaction() {
+        let value = 0x0123_4567_89ab_cdef;
+        for raw in [store_raw(3, 1, 2), amo_raw(0x01, 3, 3, 1, 2)] {
+            let writes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let mut cpu = Cpu::with_reset_vector(
+                Box::new(RejectingWriteDevice {
+                    writes: std::rc::Rc::clone(&writes),
+                }),
+                BASE,
+                BASE + 0x1000,
+            );
+            cpu.registers[1] = BASE + 0x100;
+            cpu.registers[2] = value;
+            cpu.csr.store(csr::MTVEC, BASE + 0x800);
+
+            execute_raw(&mut cpu, raw);
+
+            assert_eq!(writes.borrow().as_slice(), &[(BASE + 0x100, value, 8)]);
+            assert_eq!(cpu.csr.load(csr::MCAUSE), 7);
+            assert_eq!(cpu.csr.load(csr::MTVAL), BASE + 0x100);
+        }
     }
 
     #[test]

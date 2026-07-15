@@ -8,17 +8,21 @@ use std::collections::BTreeMap;
 
 /// CPU 与 RAM、MMIO 设备之间的最小访问协议。
 ///
-/// 地址是总线物理地址而不是设备内偏移。`write` 的数据宽度受现有接口约束为 `u32`；
-/// 需要写入 64 位值的上层必须拆成两次 32 位访问。
+/// 地址是总线物理地址而不是设备内偏移。读写宽度只能是 1、2、4 或 8 字节。
+/// 设备必须先验证完整访问，再产生写入或 MMIO 副作用；返回错误时不得留下部分写入。
 pub trait MemDevice {
     /// 从 `addr` 开始读取 `size` 个字节，并以小端整数返回。
     fn read(&mut self, addr: u64, size: usize) -> Result<u64, Exception>;
     /// 向 `addr` 开始的 `size` 个字节写入 `value` 的低位部分。
-    fn write(&mut self, addr: u64, value: u32, size: usize) -> Result<(), Exception>;
+    fn write(&mut self, addr: u64, value: u64, size: usize) -> Result<(), Exception>;
     /// 返回一个待处理的中断原因；默认设备不产生中断。
     fn pending_interrupt(&mut self) -> Option<u64> {
         None
     }
+}
+
+pub(crate) const fn valid_access_size(size: usize) -> bool {
+    matches!(size, 1 | 2 | 4 | 8)
 }
 
 /// 按物理地址分发访问的设备总线。
@@ -71,6 +75,9 @@ impl Bus {
     }
 
     fn find_dev(&mut self, addr: u64, size: usize) -> Option<&mut Box<dyn MemDevice>> {
+        if !valid_access_size(size) {
+            return None;
+        }
         let size = u64::try_from(size).ok()?;
         // 先找不大于起始地址的最后一个区域，再验证“整个访问”都没有越过区域末端。
         let (_, region) = self.devices.range_mut(..=addr).next_back()?;
@@ -82,13 +89,19 @@ impl Bus {
 
 impl MemDevice for Bus {
     fn read(&mut self, addr: u64, size: usize) -> Result<u64, Exception> {
+        if !valid_access_size(size) {
+            return Err(Exception::LoadAccessFault(addr));
+        }
         if let Some(dev) = self.find_dev(addr, size) {
             return dev.read(addr, size);
         }
         Err(Exception::LoadAccessFault(addr))
     }
 
-    fn write(&mut self, addr: u64, value: u32, size: usize) -> Result<(), Exception> {
+    fn write(&mut self, addr: u64, value: u64, size: usize) -> Result<(), Exception> {
+        if !valid_access_size(size) {
+            return Err(Exception::StoreAMOAccessFault(addr));
+        }
         if let Some(dev) = self.find_dev(addr, size) {
             return dev.write(addr, value, size);
         }
@@ -120,7 +133,7 @@ mod tests {
             Ok(0xaa)
         }
 
-        fn write(&mut self, _addr: u64, _value: u32, _size: usize) -> Result<(), Exception> {
+        fn write(&mut self, _addr: u64, _value: u64, _size: usize) -> Result<(), Exception> {
             Ok(())
         }
     }
@@ -143,7 +156,7 @@ mod tests {
         }
 
         for i in 0..size {
-            bus.write(base + i as u64, (i + 1) as u32, 1).unwrap();
+            bus.write(base + i as u64, (i + 1) as u64, 1).unwrap();
         }
         for i in 0..size {
             let val = bus.read(base + i as u64, 1).unwrap();
@@ -165,5 +178,35 @@ mod tests {
             bus.write(0x1010, 0, 1),
             Err(Exception::StoreAMOAccessFault(0x1010))
         ));
+    }
+
+    #[test]
+    fn test_bus_rejects_invalid_widths_and_overflowing_ranges() {
+        let mut bus = Bus::new();
+        bus.attach_device(0x1000, 0x10, Box::new(FixedDevice));
+
+        for size in [0, 3, 9, usize::MAX] {
+            assert_eq!(
+                bus.read(0x1000, size),
+                Err(Exception::LoadAccessFault(0x1000))
+            );
+            assert_eq!(
+                bus.write(0x1000, 0, size),
+                Err(Exception::StoreAMOAccessFault(0x1000))
+            );
+        }
+
+        let mut high_bus = Bus::new();
+        let base = u64::MAX - 0x10;
+        high_bus.attach_device(base, 0x10, Box::new(FixedDevice));
+        assert_eq!(high_bus.read(base + 8, 8), Ok(0xaa));
+        assert_eq!(
+            high_bus.read(base + 9, 8),
+            Err(Exception::LoadAccessFault(base + 9))
+        );
+        assert_eq!(
+            high_bus.write(base + 9, 0, 8),
+            Err(Exception::StoreAMOAccessFault(base + 9))
+        );
     }
 }

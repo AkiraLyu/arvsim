@@ -2,7 +2,11 @@
 //!
 //! [`Dram`] 用字节向量保存物理内存。镜像装载负责边界检查，普通总线访问则把越界映射成 RISC-V 访问错误。
 
-use crate::{bus::MemDevice, trap::Exception};
+use crate::{
+    bus::{MemDevice, valid_access_size},
+    trap::Exception,
+};
+use std::ops::Range;
 
 /// 一段从 `base` 开始的连续物理内存。
 pub struct Dram {
@@ -68,38 +72,40 @@ impl Dram {
 
         self.load_bytes(self.base, &buffer)
     }
+
+    fn access_range(&self, addr: u64, size: usize) -> Option<Range<usize>> {
+        if !valid_access_size(size) {
+            return None;
+        }
+        addr.checked_add(u64::try_from(size).ok()?)?;
+        let offset = usize::try_from(addr.checked_sub(self.base)?).ok()?;
+        let end = offset.checked_add(size)?;
+        (end <= self.dram.len()).then_some(offset..end)
+    }
 }
 
 impl MemDevice for Dram {
     fn read(&mut self, addr: u64, size: usize) -> Result<u64, Exception> {
-        if addr < self.base {
-            return Err(Exception::LoadAccessFault(addr));
-        }
-        let offset = (addr - self.base) as usize;
-        if offset + size > self.dram.len() {
-            return Err(Exception::LoadAccessFault(addr));
-        }
+        let range = self
+            .access_range(addr, size)
+            .ok_or(Exception::LoadAccessFault(addr))?;
 
         let mut val = 0u64;
-        for i in 0..size {
+        for (i, byte) in self.dram[range].iter().enumerate() {
             // 低地址字节放到整数低位，保持 guest 可见的小端顺序。
-            val |= (self.dram[offset + i] as u64) << (i * 8);
+            val |= u64::from(*byte) << (i * 8);
         }
         Ok(val)
     }
 
-    fn write(&mut self, addr: u64, value: u32, size: usize) -> Result<(), Exception> {
-        if addr < self.base {
-            return Err(Exception::StoreAMOAccessFault(addr));
-        }
-        let offset = (addr - self.base) as usize;
-        if offset + size > self.dram.len() {
-            return Err(Exception::StoreAMOAccessFault(addr));
-        }
+    fn write(&mut self, addr: u64, value: u64, size: usize) -> Result<(), Exception> {
+        let range = self
+            .access_range(addr, size)
+            .ok_or(Exception::StoreAMOAccessFault(addr))?;
 
-        for i in 0..size {
+        for (i, byte) in self.dram[range].iter_mut().enumerate() {
             // 每次只取对应字节，避免宿主端字节序影响模拟结果。
-            self.dram[offset + i] = ((value >> (i * 8)) & 0xff) as u8;
+            *byte = ((value >> (i * 8)) & 0xff) as u8;
         }
         Ok(())
     }
@@ -131,6 +137,9 @@ mod tests {
         let val = dram.read(dram.base + 6, 1).unwrap();
         assert_eq!(val, 0xde);
 
+        assert!(dram.write(dram.base + 8, 0x0123_4567_89ab_cdef, 8).is_ok());
+        assert_eq!(dram.read(dram.base + 8, 8).unwrap(), 0x0123_4567_89ab_cdef);
+
         assert!(
             dram.read(dram.base + crate::cfg::DRAM_SIZE as u64, 4)
                 .is_err()
@@ -139,6 +148,31 @@ mod tests {
             dram.write(dram.base + crate::cfg::DRAM_SIZE as u64, 0x1234, 2)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn test_dram_rejects_invalid_or_partial_accesses_without_modification() {
+        let base = 0x8000_0000;
+        let mut dram = Dram::with_layout(base, 8);
+        dram.dram.copy_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7]);
+        let original = dram.dram.clone();
+
+        for size in [0, 3, 9, usize::MAX] {
+            assert_eq!(dram.read(base, size), Err(Exception::LoadAccessFault(base)));
+            assert_eq!(
+                dram.write(base, u64::MAX, size),
+                Err(Exception::StoreAMOAccessFault(base))
+            );
+        }
+        assert_eq!(
+            dram.write(base + 4, u64::MAX, 8),
+            Err(Exception::StoreAMOAccessFault(base + 4))
+        );
+        assert_eq!(
+            dram.read(u64::MAX, 1),
+            Err(Exception::LoadAccessFault(u64::MAX))
+        );
+        assert_eq!(dram.dram, original);
     }
 
     #[test]

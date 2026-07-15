@@ -90,8 +90,8 @@ fn execute_load(cpu: &mut Cpu, inst: &Instruction) -> Result<(), Exception> {
     };
     // 有效地址先按 XLEN 环绕相加，再由 MMU 决定物理地址和读取权限。
     let virtual_addr = reg(cpu, inst.rs1).wrapping_add(imm_i(inst.raw));
+    require_load_alignment(virtual_addr, size)?;
     let addr = cpu.translate_sized(virtual_addr, MemoryAccess::Load, size)?;
-    // 当前执行器不额外拒绝未对齐地址；翻译后访问会原样交给总线设备。
     let value = match inst.funct3 {
         0x0 => sign_extend(read_load(cpu, addr, virtual_addr, 1)?, 8),
         0x1 => sign_extend(read_load(cpu, addr, virtual_addr, 2)?, 16),
@@ -115,8 +115,8 @@ fn execute_store(cpu: &mut Cpu, inst: &Instruction) -> Result<(), Exception> {
         _ => return Err(Exception::IllegalInstruction(inst.raw as u64)),
     };
     let virtual_addr = reg(cpu, inst.rs1).wrapping_add(imm_s(inst.raw));
+    require_store_alignment(virtual_addr, size)?;
     let addr = cpu.translate_sized(virtual_addr, MemoryAccess::Store, size)?;
-    // 与 load 相同，当前路径不单独实施对齐检查，设备访问结果决定是否成功。
     let value = reg(cpu, inst.rs2);
     match inst.funct3 {
         0x0 => write_mem(cpu, addr, virtual_addr, value, 1),
@@ -339,18 +339,54 @@ fn execute_amo(cpu: &mut Cpu, inst: &Instruction) -> Result<(), Exception> {
         _ => return Err(Exception::IllegalInstruction(inst.raw as u64)),
     };
     let funct5 = (inst.raw >> 27) & 0x1f;
-    let access = if funct5 == 0x02 {
-        MemoryAccess::Load
-    } else {
-        MemoryAccess::Store
-    };
+    if !matches!(
+        funct5,
+        0x00 | 0x01 | 0x02 | 0x03 | 0x04 | 0x08 | 0x0c | 0x10 | 0x14 | 0x18 | 0x1c
+    ) || (funct5 == 0x02 && inst.rs2 != 0)
+    {
+        return Err(Exception::IllegalInstruction(inst.raw as u64));
+    }
+
     let virtual_addr = reg(cpu, inst.rs1);
-    let addr = cpu.translate_sized(virtual_addr, access, width)?;
+    if funct5 == 0x02 {
+        cpu.clear_reservation();
+        require_load_alignment(virtual_addr, width)?;
+        let addr = cpu.translate_sized(virtual_addr, MemoryAccess::Load, width)?;
+        let old_raw = cpu
+            .bus
+            .read(addr, width)
+            .map_err(|_| Exception::LoadAccessFault(virtual_addr))?;
+        let old = if width == 4 {
+            sign_extend(old_raw, 32)
+        } else {
+            old_raw
+        };
+        cpu.set_reservation(addr, width);
+        write_reg(cpu, inst.rd, old);
+        return Ok(());
+    }
+
+    if funct5 == 0x03 {
+        let reservation = cpu.take_reservation();
+        require_store_alignment(virtual_addr, width)?;
+        let addr = cpu.translate_sized(virtual_addr, MemoryAccess::Store, width)?;
+        if reservation != Some((addr, width)) {
+            write_reg(cpu, inst.rd, 1);
+            return Ok(());
+        }
+        write_mem(cpu, addr, virtual_addr, reg(cpu, inst.rs2), width)?;
+        write_reg(cpu, inst.rd, 0);
+        return Ok(());
+    }
+
+    cpu.clear_reservation();
+    require_store_alignment(virtual_addr, width)?;
+    let addr = cpu.translate_sized(virtual_addr, MemoryAccess::Store, width)?;
     // 返回 rd 的 AMO.W 旧值需要符号扩展，而参与无符号运算时仍保留原始位型。
     let old_raw = cpu
         .bus
         .read(addr, width)
-        .map_err(|_| access_fault(access, virtual_addr))?;
+        .map_err(|_| Exception::StoreAMOAccessFault(virtual_addr))?;
     let old = if width == 4 {
         sign_extend(old_raw, 32)
     } else {
@@ -358,25 +394,21 @@ fn execute_amo(cpu: &mut Cpu, inst: &Instruction) -> Result<(), Exception> {
     };
     let rhs = reg(cpu, inst.rs2);
 
-    let (result, store) = match funct5 {
-        0x02 => (old, None),      // LR.W/LR.D
-        0x03 => (0, Some(rhs)),   // 当前单 hart 模型不跟踪 reservation，SC 固定成功。
-        0x01 => (old, Some(rhs)), // AMOSWAP
-        0x00 => (old, Some(old_raw.wrapping_add(rhs))),
-        0x04 => (old, Some(old_raw ^ rhs)),
-        0x08 => (old, Some(old_raw | rhs)),
-        0x0c => (old, Some(old_raw & rhs)),
-        0x10 => (old, Some(amo_min(old_raw, rhs, width))),
-        0x14 => (old, Some(amo_max(old_raw, rhs, width))),
-        0x18 => (old, Some(amo_minu(old_raw, rhs, width))),
-        0x1c => (old, Some(amo_maxu(old_raw, rhs, width))),
-        _ => return Err(Exception::IllegalInstruction(inst.raw as u64)),
+    let value = match funct5 {
+        0x01 => rhs,
+        0x00 => old_raw.wrapping_add(rhs),
+        0x04 => old_raw ^ rhs,
+        0x08 => old_raw | rhs,
+        0x0c => old_raw & rhs,
+        0x10 => amo_min(old_raw, rhs, width),
+        0x14 => amo_max(old_raw, rhs, width),
+        0x18 => amo_minu(old_raw, rhs, width),
+        0x1c => amo_maxu(old_raw, rhs, width),
+        _ => unreachable!(),
     };
 
-    if let Some(value) = store {
-        write_mem(cpu, addr, virtual_addr, value, width)?;
-    }
-    write_reg(cpu, inst.rd, result);
+    write_mem(cpu, addr, virtual_addr, value, width)?;
+    write_reg(cpu, inst.rd, old);
     Ok(())
 }
 
@@ -467,6 +499,7 @@ fn c_load(
         return Err(Exception::IllegalInstruction(raw as u64));
     }
     let virtual_addr = reg(cpu, rs1).wrapping_add(imm);
+    require_load_alignment(virtual_addr, size)?;
     let addr = cpu.translate_sized(virtual_addr, MemoryAccess::Load, size)?;
     let value = read_load(cpu, addr, virtual_addr, size)?;
     let value = if sign {
@@ -488,6 +521,7 @@ fn c_store(
     rs1: u8,
 ) -> Result<(), Exception> {
     let virtual_addr = reg(cpu, rs1).wrapping_add(imm);
+    require_store_alignment(virtual_addr, size)?;
     let addr = cpu.translate_sized(virtual_addr, MemoryAccess::Store, size)?;
     write_mem(cpu, addr, virtual_addr, reg(cpu, rs2), size)?;
     advance_compressed_pc(cpu);
@@ -744,11 +778,19 @@ fn read_load(cpu: &mut Cpu, addr: u64, virtual_addr: u64, size: usize) -> Result
         .map_err(|_| Exception::LoadAccessFault(virtual_addr))
 }
 
-fn access_fault(access: MemoryAccess, addr: u64) -> Exception {
-    match access {
-        MemoryAccess::Fetch => Exception::InstructionAccessFault(addr),
-        MemoryAccess::Load => Exception::LoadAccessFault(addr),
-        MemoryAccess::Store => Exception::StoreAMOAccessFault(addr),
+fn require_load_alignment(addr: u64, size: usize) -> Result<(), Exception> {
+    if addr & (size as u64 - 1) == 0 {
+        Ok(())
+    } else {
+        Err(Exception::LoadAccessMisaligned(addr))
+    }
+}
+
+fn require_store_alignment(addr: u64, size: usize) -> Result<(), Exception> {
+    if addr & (size as u64 - 1) == 0 {
+        Ok(())
+    } else {
+        Err(Exception::StoreAMOAddrMisaligned(addr))
     }
 }
 
@@ -759,17 +801,10 @@ fn write_mem(
     value: u64,
     size: usize,
 ) -> Result<(), Exception> {
-    let result = match size {
-        1 | 2 | 4 => cpu.bus.write(addr, value as u32, size),
-        8 => {
-            // MemDevice::write 只接收 u32，64 位存储必须按小端拆成低、高两个 32 位访问。
-            cpu.bus
-                .write(addr, value as u32, 4)
-                .and_then(|()| cpu.bus.write(addr.wrapping_add(4), (value >> 32) as u32, 4))
-        }
-        _ => Err(Exception::StoreAMOAccessFault(addr)),
-    };
-    result.map_err(|_| Exception::StoreAMOAccessFault(virtual_addr))
+    cpu.clear_reservation();
+    cpu.bus
+        .write(addr, value, size)
+        .map_err(|_| Exception::StoreAMOAccessFault(virtual_addr))
 }
 
 fn try_accelerate_memset_loop(cpu: &mut Cpu, inst: &Instruction) -> Result<bool, Exception> {
@@ -841,6 +876,7 @@ fn identity_store_range(cpu: &mut Cpu, start: u64, end: u64) -> bool {
 }
 
 fn fill_dram_bytes(cpu: &mut Cpu, start: u64, end: u64, byte: u8) -> Result<(), Exception> {
+    cpu.clear_reservation();
     let mut addr = start;
     let pattern = u32::from_le_bytes([byte; 4]);
 
@@ -849,7 +885,7 @@ fn fill_dram_bytes(cpu: &mut Cpu, start: u64, end: u64, byte: u8) -> Result<(), 
         addr = addr.wrapping_add(1);
     }
     while addr.wrapping_add(4) <= end {
-        cpu.bus.write(addr, pattern, 4)?;
+        cpu.bus.write(addr, u64::from(pattern), 4)?;
         addr = addr.wrapping_add(4);
     }
     while addr < end {
