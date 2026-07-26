@@ -630,6 +630,18 @@ impl MemDevice for TestBus {
         let mut state = self.state.borrow_mut();
         (Self::claim_plic(&mut state, false) != 0).then_some(SUPERVISOR_EXTERNAL_INTERRUPT)
     }
+
+    fn reset(&mut self) {
+        let mut state = self.state.borrow_mut();
+        // RAM、磁盘镜像和符号派生配置属于平台装载结果；只清理设备的易失运行状态。
+        state.uart_output.clear();
+        state.uart_input.clear();
+        state.uart_input_pos = 0;
+        state.plic_words.clear();
+        state.plic_pending = 0;
+        state.virtio = VirtioState::default();
+        state.mmio_log.clear();
+    }
 }
 
 /// CPU 与可观察测试总线状态的组合。
@@ -675,7 +687,7 @@ impl TestMachine {
     /// 精确执行指定步数，首个未处理异常会立即结束运行。
     pub fn run_steps(&mut self, max_steps: usize) -> Result<(), Exception> {
         for _ in 0..max_steps {
-            self.cpu.step()?;
+            self.step()?;
         }
         Ok(())
     }
@@ -692,7 +704,7 @@ impl TestMachine {
         max_steps: usize,
     ) -> Result<bool, Exception> {
         for _ in 0..max_steps {
-            self.cpu.step()?;
+            self.step()?;
             if self.state.borrow().uart_output_string().contains(needle) {
                 return Ok(true);
             }

@@ -4,9 +4,8 @@
 //! 参数或平台配置错误返回退出码 2，宿主装载失败或未被 guest trap 接管的异常返回退出码 1。
 
 use arvsim::cfg;
-use arvsim::cpu::{DebugLevel, RunOptions, RunOutcome};
 use arvsim::loader::{self, ImageFormat};
-use arvsim::machine::Platform;
+use arvsim::machine::{DebugLevel, Platform, RunOptions, RunOutcome};
 use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;

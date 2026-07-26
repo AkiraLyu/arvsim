@@ -123,9 +123,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         for _ in 0..step_chunk {
             machine
-                .cpu
                 .step()
-                .map_err(|e| format!("CPU exception after {steps} steps: {e:?}"))?;
+                .map_err(|e| format!("machine exception after {steps} steps: {e:?}"))?;
             steps = steps.wrapping_add(1);
         }
 

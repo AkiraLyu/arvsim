@@ -2,9 +2,9 @@
 
 ## 功能与实现
 
-`Cpu` 保存 32 个通用寄存器、PC、U/S/M 特权级、总线、CSR、周期计数、复位向量和初始栈指针。`step()` 依次推进时间、同步硬件中断状态、处理中断、取指、尝试可选的 xv6 快速路径，再译码并执行指令。架构异常会进入目标程序的异常入口；`run()` 按配置重复执行，直到达到步数上限或 `step()` 向宿主返回错误。当前标准执行路径会接管所有架构异常，宿主错误分支主要为接口扩展保留。
+`Cpu` 保存 32 个通用寄存器、PC、U/S/M 特权级、总线、CSR、周期计数、复位向量和初始栈指针。crate 内部的 `step()` 依次推进 CPU 时间、同步硬件中断状态、处理中断、取指、尝试可选的 xv6 快速路径，再译码并执行指令。架构异常会进入目标程序的异常入口；公开的连续运行循环位于 `Machine::run`。当前标准执行路径会接管所有架构异常，宿主错误分支主要为接口扩展保留。
 
-CPU 通过 `Box<dyn MemDevice>` 访问物理内存、MMIO 和设备中断，不依赖具体设备类型。`Machine` 仍只是转发 CPU 方法，因此时间推进和中断同步都在 CPU 内完成。
+CPU 通过 `Box<dyn MemDevice>` 访问物理内存、MMIO 和设备中断，不依赖具体设备类型。`Machine::step` 先通过同一地址空间推进平台设备，再调用 CPU 的内部单步；CPU 自己维护 `TIME` 和周期计数，并在设备推进后查询中断。
 
 ## 实现状态
 
@@ -25,9 +25,9 @@ CPU 通过 `Box<dyn MemDevice>` 访问物理内存、MMIO 和设备中断，不�
 - `Cpu` 公开 `registers`、`pc`、`bus`、`csr`、`privilege` 和 `cycles`。
 - `PrivilegeMode::{User, Supervisor, Machine}`。
 - `MemoryAccess::{Fetch, Load, Store}`。
-- `DebugLevel::{Off, Pc, Full}`、`RunOptions` 和 `RunOutcome`。
+- `DebugLevel::{Off, Pc, Full}`，并从 `machine` 重导出；`RunOptions` 和 `RunOutcome` 已移到 `machine`，旧的 `cpu` 路径保留兼容重导出。
 - `Xv6Accelerator` 保存从 xv6 ELF 解析出的函数和全局对象地址。
-- `Cpu::{new, with_reset_vector, reset, step, run, set_xv6_accelerator, clear_xv6_accelerator, translate, enter_supervisor_trap, enter_machine_trap, supervisor_return, machine_return, dump_pc, dump_registers}`。
+- `Cpu::{set_xv6_accelerator, clear_xv6_accelerator, translate, enter_supervisor_trap, enter_machine_trap, supervisor_return, machine_return, dump_pc, dump_registers}`。构造、复位和单步只在 crate 内可见，外部调用方必须通过 `Platform::build` 或 `Machine::from_address_space` 创建并运行机器。
 
 ## xv6 专用加速
 
@@ -41,9 +41,9 @@ CPU 通过 `Box<dyn MemDevice>` 访问物理内存、MMIO 和设备中断，不�
 
 ## 已知问题与改进建议
 
-- 仍是单硬件线程模型；时间每步固定增加 10，平台设备没有统一的推进和复位机制。
+- 仍是单硬件线程模型；CPU 和设备每步固定增加 10 个周期，没有可变指令时延或独立事件调度。
 - 尚未实现 aq/rl 和多硬件线程内存顺序；外部设备直接改写内存时也无法通知 CPU 清除 LR/SC 保留。
 - TLB、ASID 和实际的 `sfence.vma` 刷新尚未实现。PMP 也未覆盖扩展安全模型。
 - 目标程序没有正常停机协议。`ebreak` 会按架构进入异常入口，不能作为通用的宿主退出信号。
 - xv6 快速路径仍依赖固定结构偏移、数组步长、默认 DRAM 边界和用户程序地址，也会绕过真实指令与内存顺序，不适合运行不可信输入。
-- 后续应为平台时钟、TLB、设备写入通知和加速器布局建立独立接口。
+- 后续仍应为独立事件调度、TLB、设备写入通知和加速器布局建立更明确的接口。

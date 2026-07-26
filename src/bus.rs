@@ -1,4 +1,4 @@
-//! 内存映射设备接口和物理总线。
+//! 内存映射设备接口、设备生命周期和物理总线。
 //!
 //! [`Bus`] 维护互不重叠的半开地址区间，并把 CPU 的物理读写转发给覆盖完整访问范围的设备。
 //! 地址未命中时在总线边界统一产生访问错误，设备仍负责解释自己的寄存器偏移和访问宽度。
@@ -6,7 +6,7 @@
 use crate::trap::Exception;
 use std::collections::BTreeMap;
 
-/// CPU 与 RAM、MMIO 设备之间的最小访问协议。
+/// CPU 和机器运行层与 RAM、MMIO 设备之间的统一协议。
 ///
 /// 地址是总线物理地址而不是设备内偏移。读写宽度只能是 1、2、4 或 8 字节。
 /// 设备必须先验证完整访问，再产生写入或 MMIO 副作用；返回错误时不得留下部分写入。
@@ -19,6 +19,10 @@ pub trait MemDevice {
     fn pending_interrupt(&mut self) -> Option<u64> {
         None
     }
+    /// 恢复设备的上电状态；默认用于没有易失状态的 RAM 或同步设备。
+    fn reset(&mut self) {}
+    /// 推进 `cycles` 个平台周期；默认用于不依赖时间推进的设备。
+    fn tick(&mut self, _cycles: u64) {}
 }
 
 pub(crate) const fn valid_access_size(size: usize) -> bool {
@@ -112,6 +116,18 @@ impl MemDevice for Bus {
         self.devices
             .values_mut()
             .find_map(|region| region.dev.pending_interrupt())
+    }
+
+    fn reset(&mut self) {
+        for region in self.devices.values_mut() {
+            region.dev.reset();
+        }
+    }
+
+    fn tick(&mut self, cycles: u64) {
+        for region in self.devices.values_mut() {
+            region.dev.tick(cycles);
+        }
     }
 }
 

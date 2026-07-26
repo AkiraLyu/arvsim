@@ -14,4 +14,4 @@
 
 ## 实现建议
 
-先确定目标平台使用传统 CLINT 地址布局还是 ACLINT。实现 `msip`、`mtime`、`mtimecmp` 或相应的拆分设备，并由 `Machine` 统一推进时钟。CLINT 应为每个硬件线程提供明确的本地中断信号，CPU 只负责接收信号并进入机器模式中断入口。现有 `STIMECMP/STIP` 逻辑应作为 Sstc 单独保留，不能代替 CLINT。
+先确定目标平台使用传统 CLINT 地址布局还是 ACLINT。实现 `msip`、`mtime`、`mtimecmp` 或相应的拆分设备，通过 `MemDevice::tick/reset` 接入现有的 `Machine` 生命周期。CLINT 应为每个硬件线程提供明确的本地中断信号，CPU 只负责接收信号并进入机器模式中断入口。现有 `STIMECMP/STIP` 逻辑应作为 Sstc 单独保留，不能代替 CLINT。

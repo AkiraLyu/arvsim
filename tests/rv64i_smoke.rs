@@ -44,6 +44,29 @@ fn testbench_uart_model_captures_16550_transmit_bytes() {
 }
 
 #[test]
+fn testbench_machine_reset_clears_devices_but_preserves_ram() {
+    let bus = support::TestBus::rv64_smoke();
+    let mut machine = support::TestMachine::from_bus(bus);
+
+    machine.cpu.bus.write(cfg::DRAM_BASE, 0x2a, 1).unwrap();
+    machine
+        .cpu
+        .bus
+        .write(cfg::UART_BASE, u64::from(b'A'), 1)
+        .unwrap();
+    machine.state.borrow_mut().queue_uart_input(b"x");
+    assert_eq!(machine.state.borrow().uart_output_string(), "A");
+    assert!(!machine.state.borrow().mmio_log().is_empty());
+
+    machine.reset();
+
+    assert_eq!(machine.cpu.bus.read(cfg::DRAM_BASE, 1), Ok(0x2a));
+    assert_eq!(machine.state.borrow().uart_output_string(), "");
+    assert!(machine.state.borrow().mmio_log().is_empty());
+    assert_eq!(machine.cpu.bus.read(cfg::UART_BASE + 5, 1).unwrap() & 1, 0);
+}
+
+#[test]
 fn testbench_bus_rejects_invalid_and_partial_accesses() {
     let mut bus = support::TestBus::rv64_smoke();
     let state = bus.state();
@@ -106,9 +129,8 @@ done:
     let mut halted = false;
     for _ in 0..32 {
         machine
-            .cpu
             .step()
-            .map_err(|error| format!("unexpected CPU exception: {error:?}"))?;
+            .map_err(|error| format!("unexpected machine exception: {error:?}"))?;
         if machine.cpu.pc == RV64I_TRAP_VECTOR && machine.cpu.csr.load(csr::MCAUSE) == 3 {
             halted = true;
             break;

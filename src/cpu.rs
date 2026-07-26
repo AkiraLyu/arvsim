@@ -1,6 +1,7 @@
 //! 单 hart RV64 CPU 状态和执行循环。
 //!
-//! [`Cpu::step`] 依次推进时间、处理中断、取指、尝试可选 xv6 加速、译码执行并提交 PC。
+//! crate 内部的 CPU 单步依次推进时间、处理中断、取指、尝试可选 xv6 加速、译码执行并提交 PC；
+//! 公开调用方通过 [`crate::machine::Machine`] 同步推进 CPU 与设备。
 //! U/S/M 特权级、地址翻译和 trap 路由集中在本模块；具体物理内存和设备通过
 //! [`MemDevice`] 注入。
 
@@ -8,6 +9,9 @@ use crate::bus::MemDevice;
 use crate::csr;
 use crate::instruction;
 use crate::trap::Exception;
+
+// 保留旧导入路径；运行控制本身由 `machine` 模块定义和实现。
+pub use crate::machine::{RunOptions, RunOutcome};
 
 /// 一个 CPU hart 的可观察状态及其总线连接。
 pub struct Cpu {
@@ -59,30 +63,6 @@ pub enum DebugLevel {
     Full,
 }
 
-/// [`Cpu::run`] 的停止条件和调试配置。
-#[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
-pub struct RunOptions {
-    /// 最多成功执行的步数；`None` 表示不设上限。
-    pub max_steps: Option<u64>,
-    /// 每步执行前输出的状态详细程度。
-    pub debug: DebugLevel,
-}
-
-/// [`Cpu::run`] 离开执行循环的原因。
-#[derive(Debug, Copy, Clone)]
-pub enum RunOutcome {
-    /// 已成功执行指定步数，CPU 状态停在下一条指令之前。
-    StepLimitReached { steps: u64 },
-    /// 遇到未被 guest trap 入口接管的异常。
-    Exception {
-        /// 异常前已成功完成的步数。
-        steps: u64,
-        /// 产生异常的指令 PC。
-        pc: u64,
-        exception: Exception,
-    },
-}
-
 /// xv6 专用快速路径所需的函数入口和全局对象地址。
 ///
 /// 该配置默认关闭，必须与实际加载的 xv6 ELF 符号匹配；错误地址可能在普通指令中间误触发快速路径。
@@ -126,7 +106,7 @@ const XV6_PTE_V: u64 = 1 << 0;
 const XV6_PTE_R: u64 = 1 << 1;
 const XV6_PTE_W: u64 = 1 << 2;
 const XV6_PTE_X: u64 = 1 << 3;
-const TIMER_CYCLES_PER_STEP: u64 = 10;
+pub(crate) const CYCLES_PER_STEP: u64 = 10;
 const INTERRUPT_FLAG: u64 = 1 << 63;
 const INTERRUPT_PRIORITY: [u64; 6] = [11, 3, 7, 9, 1, 5];
 
@@ -160,13 +140,12 @@ pub enum MemoryAccess {
 }
 
 impl Cpu {
-    /// 使用默认复位向量和 DRAM 末端栈指针创建 CPU。
-    pub fn new(bus: Box<dyn MemDevice>) -> Self {
-        Self::with_reset_vector(bus, crate::cfg::CPU_START_ADDR, crate::cfg::DRAM_END)
-    }
-
     /// 使用调用方给定的复位向量和初始栈指针创建 CPU。
-    pub fn with_reset_vector(bus: Box<dyn MemDevice>, reset_vector: u64, initial_sp: u64) -> Self {
+    pub(crate) fn with_reset_vector(
+        bus: Box<dyn MemDevice>,
+        reset_vector: u64,
+        initial_sp: u64,
+    ) -> Self {
         let mut cpu = Cpu {
             registers: [0; 32],
             pc: reset_vector,
@@ -185,7 +164,7 @@ impl Cpu {
     }
 
     /// 恢复构造时的寄存器、PC、CSR 和周期状态，同时保留总线及可选加速器配置。
-    pub fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.registers = [0; 32];
         self.registers[2] = self.initial_sp;
         self.pc = self.reset_vector;
@@ -213,7 +192,7 @@ impl Cpu {
     /// 推进一个 CPU 步骤。
     ///
     /// 中断或异常被架构 trap 入口接管时也算一个成功步骤。
-    pub fn step(&mut self) -> Result<(), Exception> {
+    pub(crate) fn step(&mut self) -> Result<(), Exception> {
         // 先推进时间，使本步开始时即可观察到刚到期的定时器中断。
         self.tick();
         if self.take_pending_interrupt() {
@@ -237,36 +216,6 @@ impl Cpu {
         let new_pc = self.execute(instruction)?;
         self.pc = new_pc;
         Ok(())
-    }
-
-    /// 重复调用 [`Cpu::step`]，直到步数耗尽或出现未处理异常。
-    pub fn run(&mut self, options: RunOptions) -> RunOutcome {
-        let mut steps = 0;
-        loop {
-            if options.max_steps.is_some_and(|limit| steps >= limit) {
-                return RunOutcome::StepLimitReached { steps };
-            }
-
-            match options.debug {
-                DebugLevel::Off => {}
-                DebugLevel::Pc => self.dump_pc(),
-                DebugLevel::Full => {
-                    self.dump_pc();
-                    self.dump_registers();
-                    self.csr.dump_csr();
-                }
-            }
-
-            let pc = self.pc;
-            if let Err(exception) = self.step() {
-                return RunOutcome::Exception {
-                    steps,
-                    pc,
-                    exception,
-                };
-            }
-            steps = steps.wrapping_add(1);
-        }
     }
 
     /// 翻译当前 PC，并按指令编码实际需要的长度取指。
@@ -742,7 +691,7 @@ impl Cpu {
     }
 
     fn tick(&mut self) {
-        self.cycles = self.cycles.wrapping_add(TIMER_CYCLES_PER_STEP);
+        self.cycles = self.cycles.wrapping_add(CYCLES_PER_STEP);
         self.csr.store(csr::TIME, self.cycles);
     }
 
@@ -1452,21 +1401,17 @@ mod tests {
     }
 
     #[test]
-    fn run_reuses_step_and_stops_at_the_limit() {
+    fn step_executes_one_instruction_and_advances_the_clock() {
         let base = 0x8000_0000;
         let mut dram = Dram::with_layout(base, 16);
         dram.load_bytes(base, &[0x93, 0x0f, 0xa0, 0x02]).unwrap();
         let mut cpu = Cpu::with_reset_vector(Box::new(dram), base, base + 16);
 
-        let outcome = cpu.run(RunOptions {
-            max_steps: Some(1),
-            debug: DebugLevel::Off,
-        });
+        cpu.step().unwrap();
 
-        assert!(matches!(outcome, RunOutcome::StepLimitReached { steps: 1 }));
         assert_eq!(cpu.pc, base + 4);
         assert_eq!(cpu.registers[31], 42);
-        assert_eq!(cpu.cycles, TIMER_CYCLES_PER_STEP);
+        assert_eq!(cpu.cycles, CYCLES_PER_STEP);
     }
 
     #[test]
