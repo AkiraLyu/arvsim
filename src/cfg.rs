@@ -12,3 +12,5 @@ pub const DRAM_END: u64 = DRAM_BASE + DRAM_SIZE as u64;
 pub const CPU_START_ADDR: u64 = DRAM_BASE;
 /// 默认 UART MMIO 基址。
 pub const UART_BASE: u64 = 0x10000000;
+/// 默认 UART MMIO 窗口大小（16550 寄存器窗口）。
+pub const UART_SIZE: u64 = 0x100;

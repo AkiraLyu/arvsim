@@ -22,14 +22,14 @@
 
 ## 依赖关系
 
-- 依赖 `trap::Exception`；`attach_ram` 依赖 `cfg::DRAM_SIZE`。
+- 依赖 `trap::Exception`；`attach_ram` 依赖 `cfg::DRAM_SIZE`，`attach_uart` 依赖 `cfg::UART_SIZE`。
 - `Cpu` 持有 `Box<dyn MemDevice>`，因此既可接库中的 `Bus`，也可接测试使用的 `TestBus`；`Machine` 通过这份地址空间统一复位和推进设备。
 - DRAM 和 UART 都实现 `MemDevice`；设备用未经封装的 `u64` 返回中断原因。
 
 ## 已知问题与改进建议
 
 - `attach_device` 是公共接口，却会因空区域、溢出或重叠而使进程异常退出；绕过 `Platform` 的调用方无法正常处理这些错误。
-- `attach_ram` 固定声明 128 MiB，无法表达实际设备大小；`attach_uart` 固定 256 字节。
+- `attach_ram` 固定声明 128 MiB，无法表达实际设备大小。
 - `pending_interrupt` 按设备地址顺序返回第一个中断，没有优先级判断。
 - `reset` 和 `tick` 不能返回错误，也没有事件期限或休眠语义；复杂异步设备仍只能按固定机器步长轮询。
 - `size` 仍是 `usize`，调用方可以传入非法值，只是会收到访问错误。后续可改用 `AccessSize`，让非法宽度无法构造。

@@ -152,7 +152,7 @@ impl Platform {
 
     /// 挂载正式库中的简化 UART。
     pub fn attach_uart(&mut self, base: u64) -> Result<(), PlatformError> {
-        self.attach_device(base, 0x100, Box::new(Uart::new(base)))
+        self.attach_device(base, crate::cfg::UART_SIZE, Box::new(Uart::new(base)))
     }
 
     /// 验证复位向量并完成总线、CPU、时钟状态和中断源的组装。

@@ -573,7 +573,7 @@ impl MemDevice for TestBus {
             return Ok(value);
         }
 
-        if (cfg::UART_BASE..cfg::UART_BASE + 0x100).contains(&addr) {
+        if (cfg::UART_BASE..cfg::UART_BASE + cfg::UART_SIZE).contains(&addr) {
             return Self::read_uart(&mut state, addr, size);
         }
         if Self::virtio_offset(addr, size).is_some() {
@@ -607,7 +607,7 @@ impl MemDevice for TestBus {
             return Ok(());
         }
 
-        if (cfg::UART_BASE..cfg::UART_BASE + 0x100).contains(&addr) {
+        if (cfg::UART_BASE..cfg::UART_BASE + cfg::UART_SIZE).contains(&addr) {
             return Self::write_uart(&mut state, addr, value, size);
         }
         if Self::virtio_offset(addr, size).is_some() {

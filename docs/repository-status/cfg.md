@@ -6,7 +6,7 @@
 
 ## 实现状态
 
-默认配置为 128 MiB DRAM，地址范围是 `0x8000_0000..0x8800_0000`；复位 PC 位于 DRAM 起点，UART 基址为 `0x1000_0000`。命令行参数可以覆盖 DRAM、UART 和入口地址，`Platform` 会使用这些运行时值创建机器，因此本模块只提供默认值。
+默认配置为 128 MiB DRAM，地址范围是 `0x8000_0000..0x8800_0000`；复位 PC 位于 DRAM 起点，UART 基址为 `0x1000_0000`、窗口大小 `0x100`。命令行参数可以覆盖 DRAM、UART 和入口地址，`Platform` 会使用这些运行时值创建机器，因此本模块只提供默认值。
 
 ## 公共接口
 
@@ -15,10 +15,11 @@
 - `DRAM_END: u64`
 - `CPU_START_ADDR: u64`
 - `UART_BASE: u64`
+- `UART_SIZE: u64`
 
 ## 依赖关系
 
-`Dram` 默认构造、命令行默认参数、部分 xv6 加速和测试总线都会读取这些常量。`Bus::attach_ram` 还默认所有 RAM 都是 `DRAM_SIZE` 大小。
+`Dram` 默认构造、命令行默认参数、部分 xv6 加速和测试总线都会读取这些常量。`Bus::attach_ram` 默认所有 RAM 都是 `DRAM_SIZE` 大小，`Bus::attach_uart` 与 `Platform::attach_uart` 按 `UART_SIZE` 挂载 UART 窗口。
 
 ## 已知问题与改进建议
 

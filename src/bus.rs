@@ -56,7 +56,7 @@ impl Bus {
 
     /// 按当前 UART 窗口大小挂载设备的便捷入口。
     pub fn attach_uart(&mut self, base: u64, dev: Box<dyn MemDevice>) {
-        self.attach_device(base, 0x100, dev);
+        self.attach_device(base, crate::cfg::UART_SIZE, dev);
     }
 
     /// 挂载一个设备，并拒绝零长度、地址溢出或区间重叠。
