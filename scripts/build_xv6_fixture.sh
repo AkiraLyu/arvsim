@@ -29,7 +29,7 @@ if ((${#missing[@]} > 0)); then
   cat >&2 <<'EOF'
 
 On Arch Linux, install the missing pieces manually if needed:
-  sudo pacman -S --needed base-devel git perl riscv64-elf-gcc riscv64-elf-binutils
+  run0 pacman -S --needed base-devel git perl riscv64-elf-gcc riscv64-elf-binutils
 EOF
   exit 127
 fi
@@ -37,8 +37,12 @@ fi
 mkdir -p "$(dirname "$DEST")"
 
 if [[ ! -d "$DEST/.git" ]]; then
-  git clone --depth 1 --branch "$XV6_REF" "$XV6_REPO" "$DEST"
+  git init -q "$DEST"
+  git -C "$DEST" remote add origin "$XV6_REPO"
+  git -C "$DEST" fetch --depth 1 origin "$XV6_REF"
+  git -C "$DEST" checkout --detach FETCH_HEAD
 else
+  git -C "$DEST" remote set-url origin "$XV6_REPO"
   if git -C "$DEST" fetch --depth 1 origin "$XV6_REF"; then
     git -C "$DEST" checkout --detach FETCH_HEAD
   else
@@ -50,7 +54,11 @@ make -C "$DEST" TOOLPREFIX="$TOOLPREFIX" kernel/kernel fs.img
 "${TOOLPREFIX}objcopy" -O binary "$DEST/kernel/kernel" "$DEST/kernel/kernel.bin"
 
 commit="$(git -C "$DEST" rev-parse HEAD)"
-entry="$("${TOOLPREFIX}readelf" -h "$DEST/kernel/kernel" | awk '/Entry point address/ {print $4}')"
+entry="$(LC_ALL=C "${TOOLPREFIX}readelf" -h "$DEST/kernel/kernel" | awk '/Entry point address/ {print $4}')"
+if [[ -z "$entry" ]]; then
+  printf 'error: could not determine entry point from %s\n' "$DEST/kernel/kernel" >&2
+  exit 1
+fi
 
 cat >"$DEST/fixture.env" <<EOF
 XV6_REPO=$XV6_REPO

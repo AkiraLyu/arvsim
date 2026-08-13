@@ -32,6 +32,7 @@ struct CliOptions {
     debug: DebugLevel,
 }
 
+#[derive(Debug)]
 enum Command {
     Help,
     Run(CliOptions),
@@ -64,7 +65,8 @@ fn run(options: CliOptions) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let loaded = match loader::load_image(platform.dram_mut(), &options.image, options.format) {
+    let loaded = match loader::load_image(&mut platform.dram_mut(), &options.image, options.format)
+    {
         Ok(loaded) => loaded,
         Err(error) => {
             eprintln!(
@@ -106,7 +108,9 @@ fn run(options: CliOptions) -> ExitCode {
             pc,
             exception,
         } => {
-            eprintln!("error: guest exception after {steps} steps at pc={pc:#x}: {exception:?}");
+            eprintln!(
+                "error: fatal CPU exception after {steps} steps at pc={pc:#x}: {exception:?}"
+            );
             ExitCode::from(1)
         }
     }
@@ -120,7 +124,7 @@ where
     let mut platform = PlatformPreset::Uart;
     let mut dram_base = cfg::DRAM_BASE;
     let mut dram_size = cfg::DRAM_SIZE;
-    let mut uart_base = cfg::UART_BASE;
+    let mut uart_base = None;
     let mut entry = None;
     let mut max_steps = Some(DEFAULT_MAX_STEPS);
     let mut debug = DebugLevel::Off;
@@ -145,16 +149,25 @@ where
                     value => return Err(format!("invalid platform: {value}")),
                 }
             }
-            "--dram-base" => dram_base = parse_number(&next_value(&mut args, "--dram-base")?)?,
-            "--dram-size" => dram_size = parse_size(&next_value(&mut args, "--dram-size")?)?,
-            "--uart-base" => uart_base = parse_number(&next_value(&mut args, "--uart-base")?)?,
-            "--entry" => entry = Some(parse_number(&next_value(&mut args, "--entry")?)?),
+            "--dram-base" => {
+                dram_base = parse_number("--dram-base", &next_value(&mut args, "--dram-base")?)?
+            }
+            "--dram-size" => {
+                dram_size = parse_size("--dram-size", &next_value(&mut args, "--dram-size")?)?
+            }
+            "--uart-base" => {
+                uart_base = Some(parse_number(
+                    "--uart-base",
+                    &next_value(&mut args, "--uart-base")?,
+                )?)
+            }
+            "--entry" => entry = Some(parse_number("--entry", &next_value(&mut args, "--entry")?)?),
             "--max-steps" => {
                 let value = next_value(&mut args, "--max-steps")?;
                 max_steps = if value == "unlimited" {
                     None
                 } else {
-                    Some(parse_number(&value)?)
+                    Some(parse_number("--max-steps", &value)?)
                 };
             }
             "--debug" => {
@@ -182,13 +195,16 @@ where
     }
 
     let image = image.ok_or_else(|| "missing image path".to_string())?;
+    if platform == PlatformPreset::Bare && uart_base.is_some() {
+        return Err("--uart-base conflicts with --platform bare".into());
+    }
     Ok(Command::Run(CliOptions {
         image,
         format,
         platform,
         dram_base,
         dram_size,
-        uart_base,
+        uart_base: uart_base.unwrap_or(cfg::UART_BASE),
         entry,
         max_steps,
         debug,
@@ -211,17 +227,17 @@ fn set_image(image: &mut Option<PathBuf>, value: String) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_number(value: &str) -> Result<u64, String> {
+fn parse_number(option: &str, value: &str) -> Result<u64, String> {
     // 先移除仅用于可读性的下划线，再根据前缀选择十进制或十六进制。
     let normalized = value.replace('_', "");
     let (digits, radix) = normalized
         .strip_prefix("0x")
         .map(|digits| (digits, 16))
         .unwrap_or((&normalized, 10));
-    u64::from_str_radix(digits, radix).map_err(|_| format!("invalid number: {value}"))
+    u64::from_str_radix(digits, radix).map_err(|_| format!("invalid value for {option}: {value}"))
 }
 
-fn parse_size(value: &str) -> Result<usize, String> {
+fn parse_size(option: &str, value: &str) -> Result<usize, String> {
     let normalized = value.replace('_', "");
     let (digits, multiplier) = [
         ("GiB", 1024u64.pow(3)),
@@ -238,11 +254,12 @@ fn parse_size(value: &str) -> Result<usize, String> {
             .map(|digits| (digits, multiplier))
     })
     .unwrap_or((&normalized, 1));
-    let base = parse_number(digits)?;
+    let base =
+        parse_number(option, digits).map_err(|_| format!("invalid size for {option}: {value}"))?;
     let bytes = base
         .checked_mul(multiplier)
-        .ok_or_else(|| format!("size overflows u64: {value}"))?;
-    usize::try_from(bytes).map_err(|_| format!("size does not fit usize: {value}"))
+        .ok_or_else(|| format!("size for {option} overflows u64: {value}"))?;
+    usize::try_from(bytes).map_err(|_| format!("size for {option} does not fit usize: {value}"))
 }
 
 fn usage() -> &'static str {
@@ -252,7 +269,7 @@ Options:
   --format <auto|flat|elf>   Image format [default: auto]
   --platform <bare|uart>     Attach DRAM only or DRAM plus UART [default: uart]
   --dram-base <ADDR>         DRAM base address [default: 0x80000000]
-  --dram-size <SIZE>         DRAM size; supports KiB/MiB/GiB [default: 128MiB]
+  --dram-size <SIZE>         DRAM size; supports K/M/G and KiB/MiB/GiB [default: 128MiB]
   --uart-base <ADDR>         UART base address [default: 0x10000000]
   --entry <ADDR>             Override image entry point
   --max-steps <N|unlimited>  Execution limit [default: 1000000]
@@ -313,5 +330,28 @@ mod tests {
     fn rejects_missing_and_duplicate_images() {
         assert!(parse(&[]).is_err());
         assert!(parse(&["one.bin", "two.bin"]).is_err());
+    }
+
+    #[test]
+    fn rejects_conflicting_and_identifies_invalid_numeric_options() {
+        assert_eq!(
+            parse(&[
+                "--platform",
+                "bare",
+                "--uart-base",
+                "0x10000000",
+                "guest.bin",
+            ])
+            .unwrap_err(),
+            "--uart-base conflicts with --platform bare"
+        );
+        assert_eq!(
+            parse(&["--dram-base", "invalid", "guest.bin"]).unwrap_err(),
+            "invalid value for --dram-base: invalid"
+        );
+        assert_eq!(
+            parse(&["--dram-size", "128mib", "guest.bin"]).unwrap_err(),
+            "invalid size for --dram-size: 128mib"
+        );
     }
 }

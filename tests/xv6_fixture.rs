@@ -5,7 +5,9 @@
 
 mod support;
 
+use arvsim::cfg;
 use std::error::Error;
+use std::io::Write;
 use std::process::Command;
 
 const XV6_FAILURE_MARKERS: &[&str] = &[
@@ -20,10 +22,12 @@ const XV6_FAILURE_MARKERS: &[&str] = &[
 
 fn budget(name: &str, default: usize) -> usize {
     // 每个阶段单独配置预算，超时信息才能准确指出卡住的启动或用户态阶段。
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
+    let Ok(value) = std::env::var(name) else {
+        return default;
+    };
+    value
+        .parse()
+        .unwrap_or_else(|error| panic!("{name}={value:?} is not a valid step budget: {error}"))
 }
 
 fn boot_to_shell() -> Result<support::TestMachine, Box<dyn Error>> {
@@ -53,20 +57,39 @@ fn xv6_fixture_artifacts_are_well_formed_when_present() -> Result<(), Box<dyn Er
     let kernel_bin = support::xv6_kernel_bin();
     let fs_img = support::xv6_fs_img();
 
-    if !kernel.exists() || !kernel_bin.exists() || !fs_img.exists() {
-        eprintln!(
-            "xv6 fixture not built; run scripts/build_xv6_fixture.sh to enable artifact checks"
-        );
+    if let Err(error) = support::require_xv6_fixture() {
+        if std::env::var_os("ARVSIM_REQUIRE_XV6_FIXTURE").is_some() {
+            return Err(error);
+        }
+        writeln!(
+            std::io::stderr().lock(),
+            "SKIPPED: xv6 fixture not built; run scripts/build_xv6_fixture.sh to enable artifact checks"
+        )?;
         return Ok(());
     }
 
-    support::require_tool("riscv64-elf-readelf")?;
-    let output =
-        support::run(Command::new("riscv64-elf-readelf").args(["-h", kernel.to_str().unwrap()]))?;
+    let readelf = support::toolchain("readelf");
+    support::require_tool(&readelf)?;
+    let output = support::run(
+        Command::new(&readelf)
+            .env("LC_ALL", "C")
+            .args(["-h", kernel.to_str().unwrap()]),
+    )?;
     let header = String::from_utf8_lossy(&output.stdout);
+    let field = |key: &str, expected: &str| {
+        header
+            .lines()
+            .any(|line| line.trim_start().starts_with(key) && line.contains(expected))
+    };
 
-    assert!(header.contains("Machine:                           RISC-V"));
-    assert!(header.contains("Entry point address:               0x80000000"));
+    assert!(
+        field("Machine:", "RISC-V"),
+        "unexpected ELF header:\n{header}"
+    );
+    assert!(
+        field("Entry point address:", &format!("{:#x}", cfg::DRAM_BASE)),
+        "unexpected ELF entry point:\n{header}"
+    );
     assert!(std::fs::metadata(kernel_bin)?.len() > 0);
     assert!(std::fs::metadata(fs_img)?.len() > 0);
     Ok(())

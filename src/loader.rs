@@ -42,7 +42,7 @@ pub struct LoadedImage {
 /// 读取文件或验证镜像布局时产生的错误。
 #[derive(Debug)]
 pub enum LoadError {
-    /// 宿主文件或 DRAM 范围操作失败。
+    /// 宿主文件读取失败。
     Io(std::io::Error),
     /// 镜像头、段表或入口不符合当前装载器约束。
     InvalidImage(String),
@@ -96,7 +96,9 @@ pub fn load_image_bytes(
 
     match detected {
         ImageFormat::Flat => {
-            dram.load_bytes(dram.base, bytes)?;
+            dram.load_bytes(dram.base, bytes).map_err(|error| {
+                LoadError::InvalidImage(format!("flat image does not fit DRAM: {error}"))
+            })?;
             Ok(LoadedImage {
                 format: detected,
                 entry: dram.base,
@@ -137,12 +139,21 @@ fn load_elf64(dram: &mut Dram, bytes: &[u8]) -> Result<LoadedImage, LoadError> {
         return invalid("ELF program header is too small");
     }
 
-    let table_len = phentsize
+    phentsize
         .checked_mul(phnum)
         .and_then(|len| phoff.checked_add(len))
         .filter(|end| *end <= bytes.len())
         .ok_or_else(|| LoadError::InvalidImage("ELF program header table is truncated".into()))?;
-    let _ = table_len;
+
+    // 只有所有可装载段都未填写物理地址时，才按整个镜像统一回退到虚拟地址。
+    let mut all_paddr_zero = true;
+    for index in 0..phnum {
+        let header = phoff + index * phentsize;
+        if read_u32(bytes, header)? == PT_LOAD && read_u64(bytes, header + 24)? != 0 {
+            all_paddr_zero = false;
+            break;
+        }
+    }
 
     let mut loaded_bytes = 0u64;
     let mut load_segments = 0usize;
@@ -164,20 +175,25 @@ fn load_elf64(dram: &mut Dram, bytes: &[u8]) -> Result<LoadedImage, LoadError> {
             .checked_add(file_size)
             .filter(|end| *end <= bytes.len())
             .ok_or_else(|| LoadError::InvalidImage("ELF load segment is truncated".into()))?;
-        let address = if physical_address == 0 {
-            // 部分裸机 ELF 不填写 p_paddr，此时以虚拟地址作为实际装载地址。
+        let address = if all_paddr_zero {
             virtual_address
         } else {
             physical_address
         };
 
-        dram.load_bytes(address, &bytes[file_offset..file_end])?;
+        dram.load_bytes(address, &bytes[file_offset..file_end])
+            .map_err(|error| {
+                LoadError::InvalidImage(format!("ELF segment does not fit DRAM: {error}"))
+            })?;
         if memory_size > file_size {
             // 文件未携带的尾部对应 BSS，必须显式清零以得到 ELF 约定的初始状态。
             let bss_address = address
                 .checked_add(file_size as u64)
                 .ok_or_else(|| LoadError::InvalidImage("ELF segment address overflow".into()))?;
-            dram.zero_range(bss_address, memory_size - file_size)?;
+            dram.zero_range(bss_address, memory_size - file_size)
+                .map_err(|error| {
+                    LoadError::InvalidImage(format!("ELF segment BSS does not fit DRAM: {error}"))
+                })?;
         }
         loaded_bytes = loaded_bytes
             .checked_add(memory_size as u64)
@@ -291,6 +307,49 @@ mod tests {
         elf[18..20].copy_from_slice(&62u16.to_le_bytes());
         let mut dram = Dram::with_layout(0x8000_0000, 16);
 
+        assert!(matches!(
+            load_image_bytes(&mut dram, &elf, ImageFormat::Elf),
+            Err(LoadError::InvalidImage(_))
+        ));
+    }
+
+    #[test]
+    fn mixed_physical_addresses_keep_a_legitimate_zero_address() {
+        let mut elf = elf_with_segment();
+        elf.resize(0x108, 0);
+        elf[24..32].copy_from_slice(&0u64.to_le_bytes());
+        elf[56..58].copy_from_slice(&2u16.to_le_bytes());
+
+        let first = 64;
+        elf[first + 16..first + 24].copy_from_slice(&0x1000u64.to_le_bytes());
+        elf[first + 24..first + 32].copy_from_slice(&0u64.to_le_bytes());
+        elf[first + 40..first + 48].copy_from_slice(&4u64.to_le_bytes());
+
+        let second = first + ELF64_PROGRAM_HEADER_SIZE;
+        elf[second..second + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        elf[second + 8..second + 16].copy_from_slice(&0x104u64.to_le_bytes());
+        elf[second + 16..second + 24].copy_from_slice(&0x1004u64.to_le_bytes());
+        elf[second + 24..second + 32].copy_from_slice(&4u64.to_le_bytes());
+        elf[second + 32..second + 40].copy_from_slice(&4u64.to_le_bytes());
+        elf[second + 40..second + 48].copy_from_slice(&4u64.to_le_bytes());
+        elf[0x104..0x108].copy_from_slice(&[5, 6, 7, 8]);
+
+        let mut dram = Dram::with_layout(0, 16);
+        load_image_bytes(&mut dram, &elf, ImageFormat::Elf).unwrap();
+        assert_eq!(&dram.dram[..8], &[0x93, 0x0f, 0xa0, 0x02, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn image_layout_failures_are_invalid_images_not_io_errors() {
+        let mut dram = Dram::with_layout(0x8000_0000, 2);
+        assert!(matches!(
+            load_image_bytes(&mut dram, &[1, 2, 3], ImageFormat::Flat),
+            Err(LoadError::InvalidImage(_))
+        ));
+
+        let mut elf = elf_with_segment();
+        elf[64 + 24..64 + 32].copy_from_slice(&0x9000_0000u64.to_le_bytes());
+        let mut dram = Dram::with_layout(0x8000_0000, 16);
         assert!(matches!(
             load_image_bytes(&mut dram, &elf, ImageFormat::Elf),
             Err(LoadError::InvalidImage(_))

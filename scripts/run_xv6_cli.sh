@@ -8,12 +8,12 @@ build_fixture=0
 boot_only=0
 
 usage() {
-  cat >&2 <<'EOF'
+  cat <<'EOF'
 Usage:
   scripts/run_xv6_cli.sh [--build-fixture] [--boot-only]
 
 Options:
-  --build-fixture  Rebuild target/testbench/xv6-riscv before launching.
+  --build-fixture  Rebuild the fixture directory (XV6_DIR or the default path).
   --boot-only      Boot until the first xv6 shell prompt, then exit.
 
 Interactive mode forwards terminal input to xv6 UART. Press Ctrl-] to leave.
@@ -33,16 +33,18 @@ while (($# > 0)); do
       exit 0
       ;;
     *)
-      usage
+      usage >&2
       exit 2
       ;;
   esac
   shift
 done
 
-if [[ ! -f target/testbench/xv6-riscv/kernel/kernel.bin ||
-      ! -f target/testbench/xv6-riscv/kernel/kernel ||
-      ! -f target/testbench/xv6-riscv/fs.img ]]; then
+xv6_dir="${XV6_DIR:-$ROOT/target/testbench/xv6-riscv}"
+if [[ ! -f "$xv6_dir/kernel/kernel.bin" ||
+      ! -f "$xv6_dir/kernel/kernel" ||
+      ! -f "$xv6_dir/fs.img" ||
+      ! -f "$xv6_dir/user/_usertests" ]]; then
   build_fixture=1
 fi
 
@@ -57,8 +59,8 @@ runner="$out_dir/xv6_cli.rs"
 binary="$out_dir/xv6_cli"
 mkdir -p "$out_dir"
 
-rlib="$(find "$ROOT/target/release/deps" -maxdepth 1 -name 'libarvsim-*.rlib' | head -n 1)"
-if [[ -z "$rlib" ]]; then
+rlib="$ROOT/target/release/libarvsim.rlib"
+if [[ ! -f "$rlib" ]]; then
   printf 'could not find release arvsim rlib after cargo build\n' >&2
   exit 1
 fi
@@ -66,7 +68,9 @@ fi
 cat >"$runner" <<RS
 #[path = "${ROOT}/tests/support/mod.rs"]
 mod support;
+RS
 
+cat >>"$runner" <<'RS'
 use std::env;
 use std::error::Error;
 use std::io::{self, Read, Write};
@@ -118,23 +122,23 @@ fn main() -> Result<(), Box<dyn Error>> {
                 eprintln!("\n[arvsim] leaving xv6 cli");
                 return Ok(());
             }
-            machine.state.borrow_mut().queue_uart_input(&[byte]);
+            machine.queue_uart_bytes(&[byte]);
         }
 
         for _ in 0..step_chunk {
             machine
                 .step()
-                .map_err(|e| format!("machine exception after {steps} steps: {e:?}"))?;
+                .map_err(|e| format!("fatal CPU error after {steps} steps: {e:?}"))?;
             steps = steps.wrapping_add(1);
         }
 
-        let output = machine.state.borrow().uart_output_string();
+        let output = machine.uart_output();
         if output.len() > printed {
-            print!("{}", &output[printed..]);
+            io::stdout().write_all(&output[printed..])?;
             io::stdout().flush()?;
             printed = output.len();
 
-            if !saw_prompt && output.contains("$ ") {
+            if !saw_prompt && output.windows(2).any(|window| window == b"$ ") {
                 saw_prompt = true;
                 if boot_only {
                     eprintln!("\n[arvsim] xv6 shell prompt reached after {steps} steps");
@@ -163,7 +167,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 RS
 
 CARGO_MANIFEST_DIR="$ROOT" rustc \
-  --edition=2021 \
+  --edition=2024 \
   -C opt-level=3 \
   "$runner" \
   -L "dependency=$ROOT/target/release/deps" \

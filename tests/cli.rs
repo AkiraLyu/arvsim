@@ -11,7 +11,8 @@ fn arvsim() -> Command {
 }
 
 fn temporary_image(name: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("arvsim-{name}-{}.bin", std::process::id()))
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("arvsim-{name}-{}.bin", std::process::id()))
 }
 
 #[test]

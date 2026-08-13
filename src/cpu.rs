@@ -6,9 +6,12 @@
 //! [`MemDevice`] 注入。
 
 use crate::bus::MemDevice;
-use crate::csr;
+use crate::csr::{
+    self, PMP_CFG_ADDRESS_MASK, PMP_CFG_ADDRESS_SHIFT, PMP_CFG_EXECUTE, PMP_CFG_LOCKED,
+    PMP_CFG_READ, PMP_CFG_WRITE,
+};
 use crate::instruction;
-use crate::trap::Exception;
+use crate::trap::{Exception, INTERRUPT_FLAG, InterruptCause};
 
 // 保留旧导入路径；运行控制本身由 `machine` 模块定义和实现。
 pub use crate::machine::{RunOptions, RunOutcome};
@@ -88,14 +91,26 @@ pub struct Xv6Accelerator {
     pub cpus: u64,
     pub kmem: u64,
     pub kernel_end: u64,
+    /// guest 内核使用的物理内存排他上界（xv6 的 `PHYSTOP`）。
+    pub phys_top: u64,
+    /// 加速访存可使用的实际 DRAM 半开区间起点。
+    pub dram_base: u64,
+    /// 加速访存可使用的实际 DRAM 半开区间终点。
+    pub dram_end: u64,
     pub proc_start: u64,
     pub proc_end: u64,
     pub user_exec: Option<u64>,
 }
 
 const XV6_CPU_STRIDE: u64 = 128;
+const XV6_SPINLOCK_CPU: u64 = 16;
+const XV6_CPU_NOFF: u64 = 120;
+const XV6_CPU_INTENA: u64 = 124;
 const XV6_KMEM_FREELIST: u64 = 24;
 const XV6_PROC_STRIDE: u64 = 360;
+const XV6_PROC_COUNT: u64 = 64;
+/// 当前 xv6 兼容加速器所支持的进程表总字节数。
+pub const XV6_PROC_TABLE_SIZE: u64 = XV6_PROC_COUNT * XV6_PROC_STRIDE;
 const XV6_PROC_STATE: u64 = 24;
 const XV6_PROC_CHAN: u64 = 32;
 const XV6_PROC_SLEEPING: u32 = 2;
@@ -106,9 +121,16 @@ const XV6_PTE_V: u64 = 1 << 0;
 const XV6_PTE_R: u64 = 1 << 1;
 const XV6_PTE_W: u64 = 1 << 2;
 const XV6_PTE_X: u64 = 1 << 3;
+const XV6_SV39_ROOT_LEVEL: u8 = 2;
 pub(crate) const CYCLES_PER_STEP: u64 = 10;
-const INTERRUPT_FLAG: u64 = 1 << 63;
-const INTERRUPT_PRIORITY: [u64; 6] = [11, 3, 7, 9, 1, 5];
+const INTERRUPT_PRIORITY: [InterruptCause; 6] = [
+    InterruptCause::MachineExternal,
+    InterruptCause::MachineSoftware,
+    InterruptCause::MachineTimer,
+    InterruptCause::SupervisorExternal,
+    InterruptCause::SupervisorSoftware,
+    InterruptCause::SupervisorTimer,
+];
 
 const PTE_VALID: u64 = 1 << 0;
 const PTE_READ: u64 = 1 << 1;
@@ -120,12 +142,6 @@ const PTE_DIRTY: u64 = 1 << 7;
 const PTE_PPN_MASK: u64 = (1 << 44) - 1;
 const PTE_RESERVED_SHIFT: u32 = 54;
 
-const PMP_CFG_READ: u8 = 1 << 0;
-const PMP_CFG_WRITE: u8 = 1 << 1;
-const PMP_CFG_EXECUTE: u8 = 1 << 2;
-const PMP_CFG_ADDRESS_SHIFT: u32 = 3;
-const PMP_CFG_ADDRESS_MASK: u8 = 0b11;
-const PMP_CFG_LOCKED: u8 = 1 << 7;
 const PMP_ADDRESS_OFF: u8 = 0;
 const PMP_ADDRESS_TOR: u8 = 1;
 const PMP_ADDRESS_NA4: u8 = 2;
@@ -189,6 +205,11 @@ impl Cpu {
         self.xv6_accelerator.is_some()
     }
 
+    pub(crate) fn xv6_dram_range(&self) -> Option<(u64, u64)> {
+        self.xv6_accelerator
+            .map(|accelerator| (accelerator.dram_base, accelerator.dram_end))
+    }
+
     /// 推进一个 CPU 步骤。
     ///
     /// 中断或异常被架构 trap 入口接管时也算一个成功步骤。
@@ -249,6 +270,7 @@ impl Cpu {
     fn execute(&mut self, instruction: u64) -> Result<u64, Exception> {
         let old_pc = self.pc;
         self.pc_written = false;
+        let step = if instruction & 0b11 == 0b11 { 4 } else { 2 };
         let inst = instruction as u32;
         let decoded = instruction::decode(inst);
         match instruction::execute(self, decoded) {
@@ -256,7 +278,7 @@ impl Cpu {
                 if self.pc_written {
                     Ok(self.pc)
                 } else {
-                    Ok(old_pc.wrapping_add(4))
+                    Ok(old_pc.wrapping_add(step))
                 }
             }
             Err(exception) => {
@@ -340,12 +362,12 @@ impl Cpu {
     }
 
     /// 输出当前 PC。
-    pub fn dump_pc(&mut self) {
+    pub fn dump_pc(&self) {
         println!("pc: {:#x}", self.pc);
     }
 
     /// 输出全部整数寄存器。
-    pub fn dump_registers(&mut self) {
+    pub fn dump_registers(&self) {
         for (i, &value) in self.registers.iter().enumerate() {
             println!("x{:02}: {:#018x}", i, value);
         }
@@ -393,7 +415,7 @@ impl Cpu {
         let mut table = (satp & PTE_PPN_MASK) << 12;
 
         for level in (0..=2).rev() {
-            let pte_addr = table + vpn[level] * 8;
+            let pte_addr = table.wrapping_add(vpn[level].wrapping_mul(8));
             self.check_pmp(pte_addr, 8, PrivilegeMode::Supervisor, MemoryAccess::Load)
                 .map_err(|_| access_fault(access, addr))?;
             let pte = self
@@ -452,7 +474,7 @@ impl Cpu {
                     self.check_pmp(pte_addr, 8, PrivilegeMode::Supervisor, MemoryAccess::Store)
                         .map_err(|_| access_fault(access, addr))?;
                     self.bus
-                        .write(pte_addr, updated, 4)
+                        .write(pte_addr, updated, 8)
                         .map_err(|_| access_fault(access, addr))?;
                 }
 
@@ -643,8 +665,8 @@ impl Cpu {
         let mstatus = self.csr.load(csr::MSTATUS);
 
         // 标准中断的默认优先级：MEI、MSI、MTI、SEI、SSI、STI。
-        for cause in INTERRUPT_PRIORITY {
-            let bit = 1 << cause;
+        for interrupt in INTERRUPT_PRIORITY {
+            let bit = interrupt.mask();
             if pending & bit == 0 {
                 continue;
             }
@@ -663,7 +685,7 @@ impl Cpu {
                 PrivilegeMode::Machine
             };
 
-            self.enter_trap(target, INTERRUPT_FLAG | cause, 0);
+            self.enter_trap(target, interrupt.encoded(), 0);
             return true;
         }
 
@@ -678,13 +700,7 @@ impl Cpu {
             0
         };
 
-        let device_pending = self
-            .bus
-            .pending_interrupt()
-            .filter(|cause| cause & INTERRUPT_FLAG != 0)
-            .map(|cause| cause & !INTERRUPT_FLAG)
-            .filter(|cause| *cause < 64)
-            .map_or(0, |cause| 1 << cause);
+        let device_pending = self.bus.pending_interrupts().bits();
 
         let hardware_pending = timer_pending | device_pending;
         self.csr.update_pending(hardware_pending);
@@ -752,37 +768,20 @@ impl Cpu {
     fn fast_xv6_holding(&mut self) -> Result<bool, Exception> {
         let lock = self.registers[10];
         let locked = self.read_u32(lock)?;
-        let owner = self.read_u64(lock + 16)?;
+        let owner = self.read_u64(lock.wrapping_add(XV6_SPINLOCK_CPU))?;
         self.registers[10] = (locked != 0 && owner == self.xv6_cpu_addr()) as u64;
         self.fast_return();
         Ok(true)
     }
 
     fn fast_xv6_push_off(&mut self) -> Result<bool, Exception> {
-        let old_sie = (self.csr.load(csr::SSTATUS) & csr::MASK_SIE != 0) as u32;
-        let sstatus = self.csr.load(csr::SSTATUS) & !csr::MASK_SIE;
-        self.csr.store(csr::SSTATUS, sstatus);
-
-        let cpu = self.xv6_cpu_addr();
-        let noff = self.read_u32(cpu + 120)?;
-        // 只在最外层关中断时保存原 SIE；嵌套层退出不能覆盖最初状态。
-        if noff == 0 {
-            self.write_u32(cpu + 124, old_sie)?;
-        }
-        self.write_u32(cpu + 120, noff.wrapping_add(1))?;
+        self.fast_push_off_inline()?;
         self.fast_return();
         Ok(true)
     }
 
     fn fast_xv6_pop_off(&mut self) -> Result<bool, Exception> {
-        let cpu = self.xv6_cpu_addr();
-        let noff = self.read_u32(cpu + 120)?;
-        let new_noff = noff.saturating_sub(1);
-        self.write_u32(cpu + 120, new_noff)?;
-        if new_noff == 0 && self.read_u32(cpu + 124)? != 0 {
-            let sstatus = self.csr.load(csr::SSTATUS) | csr::MASK_SIE;
-            self.csr.store(csr::SSTATUS, sstatus);
-        }
+        self.fast_pop_off_inline()?;
         self.fast_return();
         Ok(true)
     }
@@ -791,14 +790,14 @@ impl Cpu {
         self.fast_push_off_inline()?;
         let lock = self.registers[10];
         self.write_u32(lock, 1)?;
-        self.write_u64(lock + 16, self.xv6_cpu_addr())?;
+        self.write_u64(lock.wrapping_add(XV6_SPINLOCK_CPU), self.xv6_cpu_addr())?;
         self.fast_return();
         Ok(true)
     }
 
     fn fast_xv6_release(&mut self) -> Result<bool, Exception> {
         let lock = self.registers[10];
-        self.write_u64(lock + 16, 0)?;
+        self.write_u64(lock.wrapping_add(XV6_SPINLOCK_CPU), 0)?;
         self.write_u32(lock, 0)?;
         self.fast_pop_off_inline()?;
         self.fast_return();
@@ -811,19 +810,20 @@ impl Cpu {
         self.csr.store(csr::SSTATUS, sstatus);
 
         let cpu = self.xv6_cpu_addr();
-        let noff = self.read_u32(cpu + 120)?;
+        let noff = self.read_u32(cpu.wrapping_add(XV6_CPU_NOFF))?;
+        // 只在最外层关中断时保存原 SIE；嵌套层退出不能覆盖最初状态。
         if noff == 0 {
-            self.write_u32(cpu + 124, old_sie)?;
+            self.write_u32(cpu.wrapping_add(XV6_CPU_INTENA), old_sie)?;
         }
-        self.write_u32(cpu + 120, noff.wrapping_add(1))
+        self.write_u32(cpu.wrapping_add(XV6_CPU_NOFF), noff.wrapping_add(1))
     }
 
     fn fast_pop_off_inline(&mut self) -> Result<(), Exception> {
         let cpu = self.xv6_cpu_addr();
-        let noff = self.read_u32(cpu + 120)?;
+        let noff = self.read_u32(cpu.wrapping_add(XV6_CPU_NOFF))?;
         let new_noff = noff.saturating_sub(1);
-        self.write_u32(cpu + 120, new_noff)?;
-        if new_noff == 0 && self.read_u32(cpu + 124)? != 0 {
+        self.write_u32(cpu.wrapping_add(XV6_CPU_NOFF), new_noff)?;
+        if new_noff == 0 && self.read_u32(cpu.wrapping_add(XV6_CPU_INTENA))? != 0 {
             let sstatus = self.csr.load(csr::SSTATUS) | csr::MASK_SIE;
             self.csr.store(csr::SSTATUS, sstatus);
         }
@@ -835,8 +835,8 @@ impl Cpu {
         let rhs = self.registers[11];
         let len = self.registers[12] as u32 as usize;
         for i in 0..len {
-            let a = self.read_u8(lhs + i as u64)?;
-            let b = self.read_u8(rhs + i as u64)?;
+            let a = self.read_u8(lhs.wrapping_add(i as u64))?;
+            let b = self.read_u8(rhs.wrapping_add(i as u64))?;
             if a != b {
                 self.registers[10] = ((a as i32) - (b as i32)) as i64 as u64;
                 self.fast_return();
@@ -853,12 +853,13 @@ impl Cpu {
         let src = self.registers[11];
         let len = self.registers[12] as u32 as usize;
         // 先完整读取再写回，保证源、目标区间重叠时仍符合 memmove 语义。
-        let mut bytes = Vec::with_capacity(len);
+        // 按需增长，避免 guest 给定长度直接触发巨额宿主预分配。
+        let mut bytes = Vec::new();
         for i in 0..len {
-            bytes.push(self.read_u8(src + i as u64)?);
+            bytes.push(self.read_u8(src.wrapping_add(i as u64))?);
         }
         for (i, byte) in bytes.into_iter().enumerate() {
-            self.write_u8(dst + i as u64, byte)?;
+            self.write_u8(dst.wrapping_add(i as u64), byte)?;
         }
         self.registers[10] = dst;
         self.fast_return();
@@ -870,14 +871,14 @@ impl Cpu {
         let rhs = self.registers[11];
         let len = self.registers[12] as u32 as usize;
         for i in 0..len {
-            let a = self.read_u8(lhs + i as u64)?;
+            let a = self.read_u8(lhs.wrapping_add(i as u64))?;
             if a == 0 {
-                let b = self.read_u8(rhs + i as u64)?;
+                let b = self.read_u8(rhs.wrapping_add(i as u64))?;
                 self.registers[10] = ((a as i32) - (b as i32)) as i64 as u64;
                 self.fast_return();
                 return Ok(true);
             }
-            let b = self.read_u8(rhs + i as u64)?;
+            let b = self.read_u8(rhs.wrapping_add(i as u64))?;
             if a != b {
                 self.registers[10] = ((a as i32) - (b as i32)) as i64 as u64;
                 self.fast_return();
@@ -919,8 +920,8 @@ impl Cpu {
     fn fast_xv6_strlen(&mut self) -> Result<bool, Exception> {
         let base = self.registers[10];
         let mut len = 0u64;
-        while self.read_u8(base + len)? != 0 {
-            len += 1;
+        while self.read_u8(base.wrapping_add(len))? != 0 {
+            len = len.wrapping_add(1);
         }
         self.registers[10] = len;
         self.fast_return();
@@ -929,7 +930,7 @@ impl Cpu {
 
     fn fast_xv6_freewalk(&mut self) -> Result<bool, Exception> {
         let pagetable = self.registers[10];
-        if !self.freewalk_page_table(pagetable)? {
+        if !self.freewalk_page_table(pagetable, XV6_SV39_ROOT_LEVEL)? {
             return Ok(false);
         }
         if !self.xv6_kfree_page(pagetable)? {
@@ -950,9 +951,24 @@ impl Cpu {
             return Ok(false);
         }
 
-        let Some(end) = va.checked_add(npages.saturating_mul(XV6_PGSIZE)) else {
+        let Some(end) = npages
+            .checked_mul(XV6_PGSIZE)
+            .and_then(|span| va.checked_add(span))
+        else {
             return Ok(false);
         };
+        let physical_range = if do_free {
+            let Some(accelerator) = self.xv6_accelerator else {
+                return Ok(false);
+            };
+            Some((accelerator.kernel_end, accelerator.phys_top))
+        } else {
+            None
+        };
+        if !self.xv6_sparse_leaf_range_is_safe(pagetable, va, end, physical_range)? {
+            return Ok(false);
+        }
+
         let mut addr = va;
         while addr < end {
             if let Some(pte_addr) = self.xv6_walk(pagetable, addr, false)? {
@@ -978,6 +994,17 @@ impl Cpu {
         let old = self.registers[10];
         let new = self.registers[11];
         let sz = self.registers[12];
+        let Some(accelerator) = self.xv6_accelerator else {
+            return Ok(false);
+        };
+        if !self.xv6_sparse_leaf_range_is_safe(
+            old,
+            0,
+            sz,
+            Some((accelerator.dram_base, accelerator.dram_end)),
+        )? {
+            return Ok(false);
+        }
         let mut addr = 0;
 
         while addr < sz {
@@ -1010,6 +1037,46 @@ impl Cpu {
         Ok(true)
     }
 
+    /// 修改页表前检查已存在的叶子映射。
+    ///
+    /// 当前 xv6 的惰性分配允许中间页表或叶子 PTE 缺失，`uvmunmap` 和
+    /// `uvmcopy` 都会跳过这些空洞。已存在的映射仍必须是叶子；会读写物理页时，
+    /// 还要先确认整页落在加速器声明的 DRAM 范围内，避免中途失败留下部分副作用。
+    fn xv6_sparse_leaf_range_is_safe(
+        &mut self,
+        pagetable: u64,
+        start: u64,
+        end: u64,
+        physical_range: Option<(u64, u64)>,
+    ) -> Result<bool, Exception> {
+        let mut addr = start;
+        while addr < end {
+            let Some(pte_addr) = self.xv6_walk(pagetable, addr, false)? else {
+                addr = addr.wrapping_add(XV6_PGSIZE);
+                continue;
+            };
+            let pte = self.read_phys_u64(pte_addr)?;
+            if pte & XV6_PTE_V == 0 {
+                addr = addr.wrapping_add(XV6_PGSIZE);
+                continue;
+            }
+            if pte & (XV6_PTE_R | XV6_PTE_W | XV6_PTE_X) == 0 {
+                return Ok(false);
+            }
+            if let Some((physical_start, physical_limit)) = physical_range {
+                let physical = xv6_pte_to_pa(pte);
+                let Some(physical_end) = physical.checked_add(XV6_PGSIZE) else {
+                    return Ok(false);
+                };
+                if physical < physical_start || physical_end > physical_limit {
+                    return Ok(false);
+                }
+            }
+            addr = addr.wrapping_add(XV6_PGSIZE);
+        }
+        Ok(true)
+    }
+
     fn fast_xv6_uvmunmap_range(
         &mut self,
         pagetable: u64,
@@ -1034,20 +1101,24 @@ impl Cpu {
         Ok(())
     }
 
-    fn freewalk_page_table(&mut self, pagetable: u64) -> Result<bool, Exception> {
+    fn freewalk_page_table(&mut self, pagetable: u64, level: u8) -> Result<bool, Exception> {
         for entry in 0..512 {
-            let pte_addr = pagetable + entry * 8;
+            let pte_addr = pagetable.wrapping_add(entry * 8);
             let pte = self.read_phys_u64(pte_addr)?;
-            if pte & 0x1 == 0 {
+            if pte & XV6_PTE_V == 0 {
                 continue;
             }
             // freewalk 只释放中间页表；遇到叶子映射说明调用前置条件不成立。
             if pte & (XV6_PTE_R | XV6_PTE_W | XV6_PTE_X) != 0 {
                 return Ok(false);
             }
+            // Sv39 的最低层不能再指向下级页表；更深的指针通常表示损坏或成环。
+            if level == 0 {
+                return Ok(false);
+            }
 
-            let child = ((pte >> 10) & ((1u64 << 44) - 1)) << 12;
-            if !self.freewalk_page_table(child)? {
+            let child = xv6_pte_to_pa(pte);
+            if !self.freewalk_page_table(child, level - 1)? {
                 return Ok(false);
             }
             self.write_phys_u64(pte_addr, 0)?;
@@ -1060,15 +1131,15 @@ impl Cpu {
 
     fn xv6_kfree_page(&mut self, page: u64) -> Result<bool, Exception> {
         let accelerator = self.xv6_accelerator.expect("xv6 accelerator is configured");
-        if page & 0xfff != 0 || !(accelerator.kernel_end..crate::cfg::DRAM_END).contains(&page) {
+        if page & 0xfff != 0 || !(accelerator.kernel_end..accelerator.phys_top).contains(&page) {
             return Ok(false);
         }
 
         for offset in (0..4096).step_by(8) {
-            self.write_phys_u64(page + offset, 0x0101_0101_0101_0101)?;
+            self.write_phys_u64(page.wrapping_add(offset), 0x0101_0101_0101_0101)?;
         }
 
-        let freelist = accelerator.kmem + XV6_KMEM_FREELIST;
+        let freelist = accelerator.kmem.wrapping_add(XV6_KMEM_FREELIST);
         let old_head = self.read_phys_u64(freelist)?;
         self.write_phys_u64(page, old_head)?;
         self.write_phys_u64(freelist, page)?;
@@ -1077,7 +1148,7 @@ impl Cpu {
 
     fn xv6_kalloc_page(&mut self) -> Result<Option<u64>, Exception> {
         let accelerator = self.xv6_accelerator.expect("xv6 accelerator is configured");
-        let freelist = accelerator.kmem + XV6_KMEM_FREELIST;
+        let freelist = accelerator.kmem.wrapping_add(XV6_KMEM_FREELIST);
         let page = self.read_phys_u64(freelist)?;
         if page == 0 {
             return Ok(None);
@@ -1085,7 +1156,7 @@ impl Cpu {
         let next = self.read_phys_u64(page)?;
         self.write_phys_u64(freelist, next)?;
         for offset in (0..4096).step_by(8) {
-            self.write_phys_u64(page + offset, 0x0505_0505_0505_0505)?;
+            self.write_phys_u64(page.wrapping_add(offset), 0x0505_0505_0505_0505)?;
         }
         Ok(Some(page))
     }
@@ -1101,7 +1172,7 @@ impl Cpu {
         }
 
         for level in (1..=2).rev() {
-            let pte_addr = pagetable + xv6_px(level, va) * 8;
+            let pte_addr = pagetable.wrapping_add(xv6_px(level, va).wrapping_mul(8));
             let pte = self.read_phys_u64(pte_addr)?;
             if pte & XV6_PTE_V != 0 {
                 pagetable = xv6_pte_to_pa(pte);
@@ -1118,7 +1189,7 @@ impl Cpu {
             }
         }
 
-        Ok(Some(pagetable + xv6_px(0, va) * 8))
+        Ok(Some(pagetable.wrapping_add(xv6_px(0, va).wrapping_mul(8))))
     }
 
     fn xv6_mappage(
@@ -1140,15 +1211,15 @@ impl Cpu {
 
     fn zero_phys_page(&mut self, page: u64) -> Result<(), Exception> {
         for offset in (0..4096).step_by(8) {
-            self.write_phys_u64(page + offset, 0)?;
+            self.write_phys_u64(page.wrapping_add(offset), 0)?;
         }
         Ok(())
     }
 
     fn copy_phys_page(&mut self, dst: u64, src: u64) -> Result<(), Exception> {
         for offset in (0..4096).step_by(8) {
-            let value = self.read_phys_u64(src + offset)?;
-            self.write_phys_u64(dst + offset, value)?;
+            let value = self.read_phys_u64(src.wrapping_add(offset))?;
+            self.write_phys_u64(dst.wrapping_add(offset), value)?;
         }
         Ok(())
     }
@@ -1169,12 +1240,12 @@ impl Cpu {
         let mut proc = accelerator.proc_start;
         while proc < accelerator.proc_end {
             if proc != current
-                && self.read_u32(proc + XV6_PROC_STATE)? == XV6_PROC_SLEEPING
-                && self.read_u64(proc + XV6_PROC_CHAN)? == chan
+                && self.read_u32(proc.wrapping_add(XV6_PROC_STATE))? == XV6_PROC_SLEEPING
+                && self.read_u64(proc.wrapping_add(XV6_PROC_CHAN))? == chan
             {
-                self.write_u32(proc + XV6_PROC_STATE, XV6_PROC_RUNNABLE)?;
+                self.write_u32(proc.wrapping_add(XV6_PROC_STATE), XV6_PROC_RUNNABLE)?;
             }
-            proc += XV6_PROC_STRIDE;
+            proc = proc.wrapping_add(XV6_PROC_STRIDE);
         }
 
         self.fast_return();
@@ -1218,7 +1289,9 @@ impl Cpu {
     fn xv6_cpu_addr(&self) -> u64 {
         let accelerator = self.xv6_accelerator.expect("xv6 accelerator is configured");
         let hart = self.registers[4] as i32 as i64 as u64;
-        accelerator.cpus + hart.wrapping_mul(XV6_CPU_STRIDE)
+        accelerator
+            .cpus
+            .wrapping_add(hart.wrapping_mul(XV6_CPU_STRIDE))
     }
 
     fn read_u8(&mut self, addr: u64) -> Result<u8, Exception> {
@@ -1230,6 +1303,13 @@ impl Cpu {
     }
 
     fn read_u32(&mut self, addr: u64) -> Result<u32, Exception> {
+        if addr & 0x3 != 0 {
+            let mut bytes = [0u8; 4];
+            for (offset, byte) in bytes.iter_mut().enumerate() {
+                *byte = self.read_u8(addr.wrapping_add(offset as u64))?;
+            }
+            return Ok(u32::from_le_bytes(bytes));
+        }
         let physical = self.translate_sized(addr, MemoryAccess::Load, 4)?;
         self.bus
             .read(physical, 4)
@@ -1238,6 +1318,13 @@ impl Cpu {
     }
 
     fn read_u64(&mut self, addr: u64) -> Result<u64, Exception> {
+        if addr & 0x7 != 0 {
+            let mut bytes = [0u8; 8];
+            for (offset, byte) in bytes.iter_mut().enumerate() {
+                *byte = self.read_u8(addr.wrapping_add(offset as u64))?;
+            }
+            return Ok(u64::from_le_bytes(bytes));
+        }
         let physical = self.translate_sized(addr, MemoryAccess::Load, 8)?;
         self.bus
             .read(physical, 8)
@@ -1253,6 +1340,12 @@ impl Cpu {
     }
 
     fn write_u32(&mut self, addr: u64, value: u32) -> Result<(), Exception> {
+        if addr & 0x3 != 0 {
+            for (offset, byte) in value.to_le_bytes().into_iter().enumerate() {
+                self.write_u8(addr.wrapping_add(offset as u64), byte)?;
+            }
+            return Ok(());
+        }
         let physical = self.translate_sized(addr, MemoryAccess::Store, 4)?;
         self.clear_reservation();
         self.bus
@@ -1261,6 +1354,12 @@ impl Cpu {
     }
 
     fn write_u64(&mut self, addr: u64, value: u64) -> Result<(), Exception> {
+        if addr & 0x7 != 0 {
+            for (offset, byte) in value.to_le_bytes().into_iter().enumerate() {
+                self.write_u8(addr.wrapping_add(offset as u64), byte)?;
+            }
+            return Ok(());
+        }
         let physical = self.translate_sized(addr, MemoryAccess::Store, 8)?;
         self.clear_reservation();
         self.bus
@@ -1295,9 +1394,9 @@ fn trap_vector(vector: u64, cause: u64) -> u64 {
 }
 
 fn pmp_range(previous: u64, address: u64, config: u8) -> Option<(u64, u64)> {
-    match (config >> PMP_CFG_ADDRESS_SHIFT) & PMP_CFG_ADDRESS_MASK {
+    match (config & PMP_CFG_ADDRESS_MASK) >> PMP_CFG_ADDRESS_SHIFT {
         PMP_ADDRESS_OFF => None,
-        PMP_ADDRESS_TOR => Some((previous << 2, address << 2)),
+        PMP_ADDRESS_TOR => (previous < address).then_some((previous << 2, address << 2)),
         PMP_ADDRESS_NA4 => {
             let start = address << 2;
             Some((start, start.checked_add(4)?))
@@ -1371,6 +1470,23 @@ mod tests {
         fn write(&mut self, addr: u64, value: u64, size: usize) -> Result<(), Exception> {
             self.writes.borrow_mut().push((addr, value, size));
             Err(Exception::StoreAMOAccessFault(addr))
+        }
+    }
+
+    struct RecordingDram {
+        dram: Dram,
+        writes: std::rc::Rc<std::cell::RefCell<Vec<(u64, u64, usize)>>>,
+    }
+
+    impl crate::bus::MemDevice for RecordingDram {
+        fn read(&mut self, addr: u64, size: usize) -> Result<u64, Exception> {
+            self.dram.read(addr, size)
+        }
+
+        fn write(&mut self, addr: u64, value: u64, size: usize) -> Result<(), Exception> {
+            self.dram.write(addr, value, size)?;
+            self.writes.borrow_mut().push((addr, value, size));
+            Ok(())
         }
     }
 
@@ -1479,6 +1595,43 @@ mod tests {
             assert_eq!(cpu.csr.load(csr::MTVAL), addr, "raw={raw:#x}");
             assert_eq!(cpu.csr.load(csr::MEPC), BASE, "raw={raw:#x}");
         }
+    }
+
+    #[test]
+    fn reserved_mul_div_word_encoding_raises_illegal_instruction() {
+        let mut cpu = test_cpu();
+        cpu.csr.store(csr::MTVEC, BASE + 0x8000);
+
+        execute_raw(&mut cpu, 0x0200_103b); // funct3=1 不对应任何 RV64M W 型指令。
+
+        assert_eq!(cpu.pc, BASE + 0x8000);
+        assert_eq!(cpu.csr.load(csr::MCAUSE), 2);
+        assert_eq!(cpu.csr.load(csr::MTVAL), 0x0200_103b);
+    }
+
+    #[test]
+    fn freewalk_acceleration_rejects_cyclic_page_tables() {
+        let mut cpu = test_cpu();
+        write_phys_u64(&mut cpu, BASE, xv6_pa_to_pte(BASE) | XV6_PTE_V);
+
+        assert_eq!(
+            cpu.freewalk_page_table(BASE, XV6_SV39_ROOT_LEVEL),
+            Ok(false)
+        );
+        assert_eq!(cpu.bus.read(BASE, 8), Ok(xv6_pa_to_pte(BASE) | XV6_PTE_V));
+    }
+
+    #[test]
+    fn xv6_unmap_acceleration_skips_missing_lazy_pages() {
+        let mut cpu = test_cpu();
+        let leaf = install_sv39_mapping(&mut cpu, 0, BASE + 0x4000, XV6_PTE_R | XV6_PTE_W);
+        cpu.registers[10] = BASE;
+        cpu.registers[11] = 0;
+        cpu.registers[12] = 2;
+        cpu.registers[13] = 0;
+
+        assert_eq!(cpu.fast_xv6_uvmunmap(), Ok(true));
+        assert_eq!(cpu.bus.read(leaf, 8), Ok(0));
     }
 
     #[test]
@@ -1678,7 +1831,10 @@ mod tests {
         assert!(cpu.take_pending_interrupt());
         assert_eq!(cpu.privilege, PrivilegeMode::Supervisor);
         assert_eq!(cpu.pc, 0x2000 + 4 * 9);
-        assert_eq!(cpu.csr.load(csr::SCAUSE), (1 << 63) | 9);
+        assert_eq!(
+            cpu.csr.load(csr::SCAUSE),
+            InterruptCause::SupervisorExternal.encoded()
+        );
 
         let mut cpu = test_cpu();
         cpu.privilege = PrivilegeMode::Machine;
@@ -1714,7 +1870,10 @@ mod tests {
         assert!(cpu.take_pending_interrupt());
         assert_eq!(cpu.privilege, PrivilegeMode::Machine);
         assert_eq!(cpu.pc, 0x5000 + 4 * 9);
-        assert_eq!(cpu.csr.load(csr::MCAUSE), (1 << 63) | 9);
+        assert_eq!(
+            cpu.csr.load(csr::MCAUSE),
+            InterruptCause::SupervisorExternal.encoded()
+        );
     }
 
     #[test]
@@ -1868,6 +2027,9 @@ mod tests {
             cpu.translate(BASE - 1, MemoryAccess::Load),
             Err(Exception::LoadAccessFault(BASE - 1))
         );
+
+        assert_eq!(pmp_range(2, 1, 0x08), None);
+        assert_eq!(pmp_range(1, 1, 0x08), None);
     }
 
     #[test]
@@ -1985,6 +2147,73 @@ mod tests {
             cpu.translate(noncanonical, MemoryAccess::Load),
             Ok(noncanonical)
         );
+    }
+
+    #[test]
+    fn sv39_updates_the_complete_eight_byte_pte() {
+        const VIRTUAL: u64 = 0x4000;
+        const PHYSICAL: u64 = BASE + 0x4000;
+        let writes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let mut cpu = Cpu::with_reset_vector(
+            Box::new(RecordingDram {
+                dram: Dram::with_layout(BASE, MEMORY_SIZE),
+                writes: std::rc::Rc::clone(&writes),
+            }),
+            BASE,
+            BASE + MEMORY_SIZE as u64,
+        );
+        allow_all_memory(&mut cpu);
+        let leaf = install_sv39_mapping(&mut cpu, VIRTUAL, PHYSICAL, PTE_READ | PTE_USER);
+        writes.borrow_mut().clear();
+        cpu.privilege = PrivilegeMode::User;
+
+        assert_eq!(cpu.translate(VIRTUAL, MemoryAccess::Load), Ok(PHYSICAL));
+        assert_eq!(writes.borrow().len(), 1);
+        let (addr, _, size) = writes.borrow()[0];
+        assert_eq!(addr, leaf);
+        assert_eq!(size, 8);
+    }
+
+    #[test]
+    fn unaligned_fast_helpers_translate_each_cross_page_byte() {
+        const VIRTUAL: u64 = 0x4000;
+        const FIRST_PHYSICAL: u64 = BASE + 0x6000;
+        const SECOND_PHYSICAL: u64 = BASE + 0x8000;
+        const FLAGS: u64 = PTE_READ | PTE_WRITE | PTE_USER | PTE_ACCESSED | PTE_DIRTY;
+
+        let mut cpu = test_cpu();
+        allow_all_memory(&mut cpu);
+        install_sv39_mapping(&mut cpu, VIRTUAL, FIRST_PHYSICAL, FLAGS);
+        install_sv39_mapping(&mut cpu, VIRTUAL + XV6_PGSIZE, SECOND_PHYSICAL, FLAGS);
+        let virtual_addr = VIRTUAL + XV6_PGSIZE - 3;
+        for (index, byte) in [1u8, 2, 3].into_iter().enumerate() {
+            cpu.bus
+                .write(
+                    FIRST_PHYSICAL + XV6_PGSIZE - 3 + index as u64,
+                    byte.into(),
+                    1,
+                )
+                .unwrap();
+        }
+        for (index, byte) in [4u8, 5, 6, 7, 8].into_iter().enumerate() {
+            cpu.bus
+                .write(SECOND_PHYSICAL + index as u64, byte.into(), 1)
+                .unwrap();
+        }
+        cpu.privilege = PrivilegeMode::User;
+
+        assert_eq!(
+            cpu.read_u64(virtual_addr),
+            Ok(u64::from_le_bytes([1, 2, 3, 4, 5, 6, 7, 8]))
+        );
+
+        let replacement = 0x8877_6655_4433_2211;
+        cpu.write_u64(virtual_addr, replacement).unwrap();
+        cpu.privilege = PrivilegeMode::Machine;
+        assert_eq!(cpu.bus.read(FIRST_PHYSICAL + XV6_PGSIZE - 3, 2), Ok(0x2211));
+        assert_eq!(cpu.bus.read(FIRST_PHYSICAL + XV6_PGSIZE - 1, 1), Ok(0x33));
+        assert_eq!(cpu.bus.read(SECOND_PHYSICAL, 4), Ok(0x7766_5544));
+        assert_eq!(cpu.bus.read(SECOND_PHYSICAL + 4, 1), Ok(0x88));
     }
 
     #[test]

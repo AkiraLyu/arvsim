@@ -1,41 +1,32 @@
-# `tests/support/mod.rs`：测试机器与 xv6 平台
+# `tests/support/mod.rs`：测试机器与 xv6 fixture 工具
 
 ## 功能与实现
 
-该模块为 CPU 集成测试提供 RAM、UART、PLIC、virtio-blk、MMIO 日志、xv6 测试文件路径和外部命令工具。`TestBus` 通过 `Rc<RefCell<TestBusState>>` 共享状态，并作为完整地址空间传给 `Machine`，因此测试可以在运行期间输入 UART 数据并读取输出。`TestMachine` 的固定步数和文本等待辅助函数都通过 `Machine::step()` 运行。
+该模块只负责测试编排：创建正式 `VirtPlatform`、装载 flat kernel 和磁盘镜像、从 kernel 与 usertests ELF 解析加速符号、编译临时 RV64 汇编，以及按正式 `BufferedUartBackend` 的输出组织等待和失败诊断。UART、PLIC、virtio-blk、DMA、RAM 地址分发和中断连接均来自 `src/`，测试目录不再实现运行时设备。
+
+`TestMachine` 包装 `VirtMachine` 并保留缓冲 UART 与内存块后端句柄。固定步数运行和文本等待全部调用 `Machine::step`；文本搜索只检查新增输出并保留跨边界重叠区。机器复位由正式设备执行：DRAM 和块介质保留，UART 输入输出、PLIC 和 virtio transport 易失状态清除。
 
 ## 实现状态
 
-测试专用但功能较完整：
+- 冒烟平台可选择实际 DRAM 容量，栈顶由正式 `Platform` 按 DRAM 末端计算并保持 16 字节对齐。
+- xv6 平台使用 `VirtPlatformConfig::default` 的集中地址与 IRQ 配置。
+- kernel 函数、全局对象和用户态 `exec` 均从实际 ELF 符号表解析；不再读取或绕过 xv6 的 `tx_busy`，virtio 也不再知道或修改 `struct buf` 的私有偏移。
+- UART 输入经过正式 RX/IIR/PLIC/claim-complete 路径；磁盘完成经过正式 used ring、virtio 中断状态和 PLIC IRQ 1 路径。
+- 不再维护测试专用 MMIO 日志；设备寄存器边界由各正式模块的单元测试覆盖。
 
-- RAM：可选 1 MiB 冒烟测试配置或 128 MiB xv6 配置，支持裸二进制镜像。
-- UART：维护输出缓冲、输入队列和 LSR 收发状态；收到输入后设置 PLIC 的 UART 待处理位。
-- PLIC：为 UART 中断号 10 实现优先级、待处理位、监督模式使能、阈值和领取/完成（claim/complete）操作。
-- virtio 块设备：实现关键的识别、状态和队列寄存器，以及一个长度为 8 的队列、描述符链、磁盘读写、已用描述符环和中断状态。
-- 访问检查：RAM 支持 1、2、4、8 字节，UART 只支持 1 字节，virtio 只支持 4 字节，PLIC 支持不跨 32 位寄存器的 1、2、4 字节访问；非法宽度和溢出地址会返回访问错误。
-- 机器控制：通过正式机器入口固定步数运行、运行到 UART 包含目标文本、失败标记检查。
-- 生命周期：机器复位会保留已装载 RAM、磁盘镜像和 xv6 符号配置，并清除 UART、PLIC、virtio 与 MMIO 日志的易失状态；当前测试设备不需要周期推进。
-- xv6 测试文件工具：编译临时 RV64 汇编、定位内核和文件系统镜像，并调用 `nm`、`readelf` 等外部工具。
+## 测试辅助接口
 
-## 公共接口
-
-- `MmioAccessKind`、`MmioAccess`。
-- `TestBusState` 的镜像加载、UART 注入/输出、MMIO 日志方法。
-- `TestBus::{new, rv64_smoke, xv6_sized, state, load_flat_binary, load_disk_image}` 和 `MemDevice` 实现。
-- `TestMachine::{from_bus, with_flat_binary, run_steps, queue_uart_input, run_until_uart_contains, require_uart_contains, require_uart_lacks}`。
-- `build_flat_asm`、xv6 测试文件路径与检查、`xv6_machine`、`require_tool`、`run`。
+- `TestMachine::{empty, rv64_smoke, with_flat_binary, run_steps, queue_uart_input, queue_uart_bytes, uart_output, uart_output_string, run_until_uart_contains, require_uart_contains, require_uart_lacks}`。
+- `build_flat_asm`、`xv6_dir`、`toolchain`、xv6 fixture 路径与检查、`xv6_machine`、`require_tool`、`run`。
 
 ## 依赖关系
 
-模块依赖库中的 `Machine`、`Xv6Accelerator`、`cfg`、`MemDevice` 和 `Exception`，并实现 `MemDevice::reset`，但没有复用 `Bus`、`Dram` 和 `Uart`。virtio 实现知道 xv6 `struct buf` 中 `data` 位于偏移 88，并会直接清除特定字段。`xv6_machine` 只调用一次 `riscv64-elf-nm`，读取所需的内核函数、全局对象和 `tx_busy` 地址，再启用 CPU 加速。符号地址不再硬编码，但结构布局仍与特定 xv6 版本绑定。
+依赖库中的 `VirtPlatform`、`Machine`、`BufferedUartBackend`、`MemoryBlockBackend`、`Xv6Accelerator` 和 `Exception`。文件与工具链操作仍只属于测试层；正式设备模块不依赖 `tests/` 或 xv6。
 
-## 已知问题与改进建议
+## 已知问题
 
-- 一个约 900 行文件混合了设备、机器、构造代码和命令行工具，职责过多。
-- `RefCell` 的运行时借用检查只适合单线程。大多数字段虽然私有，脚本仍会通过直接包含源码来复用它们。
-- PLIC 只支持 UART；virtio 尚未完整实现特性协商、合法状态转换、队列校验和中断请求到 PLIC 的连接。
-- virtio 的 `queue_num`、扇区和描述符计算仍缺少完整校验；恶意测试文件可能触发除零、整数溢出或不准确的错误类型。当前测试只使用可信的 xv6 测试文件。
-- 测试设备目前都在 MMIO 访问时同步完成工作，没有覆盖 `tick` 的异步设备测试；以后增加此类设备时仍需验证推进顺序和中断到期边界。
-- `run_until_uart_contains` 每执行一步都会复制并解码全部 UART 输出，且只在阶段结束后检查失败标记。长测试可能因此反复处理相同文本，并延迟报告 xv6 的 `panic` 信息。
-- 测试 UART 与正式 UART 行为不一致，可能掩盖命令行平台的问题。
-- 建议将可复用设备移到正式 `devices/` 和 `platform/virt` 模块，只在测试目录保留辅助代码；同时固定 xv6 版本，并增加设备单元测试和非法描述符测试。
+- fixture 仍依赖外部 xv6 仓库、RISC-V 工具链和本机命令，版本固定与哈希校验尚未完成。
+- `Xv6Accelerator` 仍依赖特定 xv6 数据结构布局，虽然函数地址已不再硬编码。
+- `require_tool` 把由 `TOOLPREFIX` 形成的工具名直接拼入 `sh -c` 源码；空格或 shell 元字符会改变探测命令，应改为参数传递或在 Rust 中遍历 `PATH`。
+- UART 等待仍只在阶段结束后统一检查失败标记，xv6 的 panic 信息可能延迟到当前等待目标超时后才报告。
+- `run_xv6_cli.sh` 仍通过临时 Rust 程序包含本模块；应改成正式可执行目标或 example。

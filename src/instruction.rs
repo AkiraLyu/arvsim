@@ -5,7 +5,6 @@
 //! 并在每条指令结束时恢复零号寄存器约束。
 
 use crate::{
-    cfg,
     cpu::{Cpu, MemoryAccess, PrivilegeMode},
     csr,
     trap::Exception,
@@ -55,7 +54,11 @@ pub fn execute(cpu: &mut Cpu, inst: Instruction) -> Result<(), Exception> {
 
     let result = match inst.opcode {
         0x03 => execute_load(cpu, &inst),
-        0x0f => Ok(()), // FENCE/FENCE.I are conservative no-ops in this single-hart model.
+        0x0f => match inst.funct3 {
+            // FENCE/FENCE.I 在单硬件线程模型中保守地视为空操作。
+            0x0 | 0x1 => Ok(()),
+            _ => Err(Exception::IllegalInstruction(inst.raw as u64)),
+        },
         0x13 => execute_op_imm(cpu, &inst),
         0x17 => {
             write_reg(cpu, inst.rd, cpu.pc.wrapping_add(imm_u(inst.raw)));
@@ -191,7 +194,7 @@ fn execute_op_32(cpu: &mut Cpu, inst: &Instruction) -> Result<(), Exception> {
         (0x00, 0x1) => sign_extend32((lhs as u32).wrapping_shl((rhs & 0x1f) as u32)),
         (0x00, 0x5) => sign_extend32((lhs as u32).wrapping_shr((rhs & 0x1f) as u32)),
         (0x20, 0x5) => sign_extend32(((lhs as u32 as i32) >> (rhs & 0x1f)) as u32),
-        (0x01, _) => execute_mul_div_32(lhs, rhs, inst.funct3),
+        (0x01, 0x0 | 0x4 | 0x5 | 0x6 | 0x7) => execute_mul_div_32(lhs, rhs, inst.funct3),
         _ => return Err(Exception::IllegalInstruction(inst.raw as u64)),
     };
     write_reg(cpu, inst.rd, value);
@@ -564,11 +567,12 @@ fn c_lui_addi16sp(cpu: &mut Cpu, raw: u16) -> Result<(), Exception> {
             return Err(Exception::IllegalInstruction(raw as u64));
         }
         write_reg(cpu, 2, reg(cpu, 2).wrapping_add(imm));
-    } else if rd != 0 {
+    } else {
         let imm = c_imm6(raw);
         if imm == 0 {
             return Err(Exception::IllegalInstruction(raw as u64));
         }
+        // rd=x0 且立即数非零是 HINT，由 write_reg 屏蔽为空操作。
         write_reg(cpu, rd, sign_extend((imm & 0x3f) << 12, 18));
     }
     advance_compressed_pc(cpu);
@@ -627,7 +631,7 @@ fn c_jr_mv_add(cpu: &mut Cpu, raw: u16) -> Result<(), Exception> {
     let rd = c_rd(raw);
     let rs2 = c_rs2(raw);
     match ((raw >> 12) & 1, rd, rs2) {
-        (0, 0, _) => Err(Exception::IllegalInstruction(raw as u64)),
+        (0, 0, 0) => Err(Exception::IllegalInstruction(raw as u64)),
         (0, _, 0) => {
             cpu.write_pc(reg(cpu, rd) & !1);
             Ok(())
@@ -782,7 +786,7 @@ fn require_load_alignment(addr: u64, size: usize) -> Result<(), Exception> {
     if addr & (size as u64 - 1) == 0 {
         Ok(())
     } else {
-        Err(Exception::LoadAccessMisaligned(addr))
+        Err(Exception::LoadAddrMisaligned(addr))
     }
 }
 
@@ -837,8 +841,7 @@ fn try_accelerate_memset_loop(cpu: &mut Cpu, inst: &Instruction) -> Result<bool,
     };
 
     let store = decode(store_raw);
-    let is_zero_offset_sb =
-        store.opcode == 0x23 && store.funct3 == 0 && store.rs1 == inst.rs1 && imm_s(store.raw) == 0;
+    let is_zero_offset_sb = is_constant_byte_store(&store, inst.rs1);
     let is_addi_one = addi_raw & 0x3 == 0x1
         && (addi_raw >> 13) & 0x7 == 0
         && c_rd(addi_raw) == inst.rs1
@@ -849,7 +852,10 @@ fn try_accelerate_memset_loop(cpu: &mut Cpu, inst: &Instruction) -> Result<bool,
 
     let start = reg(cpu, inst.rs1);
     let end = reg(cpu, inst.rs2);
-    if start >= end || start < cfg::DRAM_BASE || end > cfg::DRAM_END {
+    let Some((dram_base, dram_end)) = cpu.xv6_dram_range() else {
+        return Ok(false);
+    };
+    if start >= end || start < dram_base || end > dram_end {
         return Ok(false);
     }
     if !identity_store_range(cpu, start, end) {
@@ -860,6 +866,15 @@ fn try_accelerate_memset_loop(cpu: &mut Cpu, inst: &Instruction) -> Result<bool,
     write_reg(cpu, inst.rs1, end);
     cpu.write_pc(cpu.pc.wrapping_add(4));
     Ok(true)
+}
+
+fn is_constant_byte_store(store: &Instruction, pointer: u8) -> bool {
+    store.opcode == 0x23
+        && store.funct3 == 0
+        && store.rs1 == pointer
+        // 源寄存器若也是循环指针，每轮写入值都会变化，不能合并成常量填充。
+        && store.rs2 != pointer
+        && imm_s(store.raw) == 0
 }
 
 fn identity_store_range(cpu: &mut Cpu, start: u64, end: u64) -> bool {
@@ -1057,7 +1072,7 @@ fn c_ld_imm(raw: u16) -> u64 {
 }
 
 fn c_lwsp_imm(raw: u16) -> u64 {
-    ((raw as u64 >> 7) & 0x20) | ((raw as u64 >> 4) & 0x1c) | (((raw as u64) << 4) & 0xc0)
+    ((raw as u64 >> 7) & 0x20) | ((raw as u64 >> 2) & 0x1c) | (((raw as u64) << 4) & 0xc0)
 }
 
 fn c_ldsp_imm(raw: u16) -> u64 {
@@ -1075,6 +1090,17 @@ fn c_sdsp_imm(raw: u16) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dram::Dram;
+
+    const TEST_BASE: u64 = 0x8000_0000;
+
+    fn test_cpu() -> Cpu {
+        Cpu::with_reset_vector(
+            Box::new(Dram::with_layout(TEST_BASE, 16)),
+            TEST_BASE,
+            TEST_BASE + 16,
+        )
+    }
 
     #[test]
     fn test_decode_addi() {
@@ -1102,10 +1128,48 @@ mod tests {
     fn common_compressed_immediates_match_xv6_encodings() {
         assert_eq!(c_imm6(0x1141), u64::MAX - 15); // c.addi sp, -16
         assert_eq!(c_addi16sp_imm(0x6109), 128);
+        assert_eq!(c_lwsp_imm(0x47b2), 12); // c.lwsp a5, 12(sp)
+        assert_eq!(c_lwsp_imm(0x4502), 0); // c.lwsp a0, 0(sp)
+        assert_eq!(c_lwsp_imm(0x4412), 4); // c.lwsp s0, 4(sp)
         assert_eq!(c_ldsp_imm(0x60a2), 8);
+        assert_eq!(c_swsp_imm(0xc62a), 12); // c.swsp a0, 12(sp)
         assert_eq!(c_sdsp_imm(0xe406), 8);
         assert_eq!(c_j_imm(0xa001), 0);
         assert_eq!(c_j_imm(0xb761), u64::MAX - 119);
         assert_eq!(c_b_imm(0xdfe5), u64::MAX - 7);
+    }
+
+    #[test]
+    fn memset_acceleration_rejects_a_mutating_store_value() {
+        let pointer = 10;
+        let aliased_store = decode(0x00a5_0023); // sb a0, 0(a0)
+        let constant_store = decode(0x00b5_0023); // sb a1, 0(a0)
+
+        assert!(!is_constant_byte_store(&aliased_store, pointer));
+        assert!(is_constant_byte_store(&constant_store, pointer));
+    }
+
+    #[test]
+    fn reserved_misc_mem_and_compressed_encodings_follow_the_spec() {
+        let mut cpu = test_cpu();
+        let reserved_misc_mem = 0x0000_200f;
+        assert_eq!(
+            execute(&mut cpu, decode(reserved_misc_mem)),
+            Err(Exception::IllegalInstruction(u64::from(reserved_misc_mem)))
+        );
+
+        let reserved_c_lui = 0x6001;
+        assert_eq!(
+            execute(&mut cpu, decode(reserved_c_lui)),
+            Err(Exception::IllegalInstruction(u64::from(reserved_c_lui)))
+        );
+
+        cpu.pc = TEST_BASE;
+        assert_eq!(execute(&mut cpu, decode(0x8006)), Ok(())); // c.mv x0, x1 是 HINT。
+        assert_eq!(cpu.pc, TEST_BASE + 2);
+        assert_eq!(
+            execute(&mut cpu, decode(0x8002)),
+            Err(Exception::IllegalInstruction(0x8002))
+        );
     }
 }

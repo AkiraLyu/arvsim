@@ -61,6 +61,34 @@ impl Dram {
         Ok(())
     }
 
+    /// 为 DMA 设备复制一段任意长度的物理内存。
+    pub fn read_bytes(&self, addr: u64, output: &mut [u8]) -> Result<(), Exception> {
+        let offset = addr
+            .checked_sub(self.base)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or(Exception::LoadAccessFault(addr))?;
+        let end = offset
+            .checked_add(output.len())
+            .filter(|end| *end <= self.dram.len())
+            .ok_or(Exception::LoadAccessFault(addr))?;
+        output.copy_from_slice(&self.dram[offset..end]);
+        Ok(())
+    }
+
+    /// 接收 DMA 设备写回的一段任意长度物理内存。
+    pub fn write_bytes(&mut self, addr: u64, input: &[u8]) -> Result<(), Exception> {
+        let offset = addr
+            .checked_sub(self.base)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or(Exception::StoreAMOAccessFault(addr))?;
+        let end = offset
+            .checked_add(input.len())
+            .filter(|end| *end <= self.dram.len())
+            .ok_or(Exception::StoreAMOAccessFault(addr))?;
+        self.dram[offset..end].copy_from_slice(input);
+        Ok(())
+    }
+
     /// 将 flat binary 装载到 DRAM 基址。
     pub fn load(&mut self, filename: &str) -> Result<(), std::io::Error> {
         use std::fs::File;

@@ -6,17 +6,17 @@
 
 ## 实现状态
 
-已经支持基本读写、镜像大小检查、默认布局和运行时 `base/size` 布局，也可以在指定地址装载字节或清零一段范围。读写只接受 1、2、4、8 字节；地址转换、长度相加和切片范围都经过检查。失败访问会在修改内存前返回错误。单元测试覆盖全部合法宽度、非法宽度、整数溢出、部分越界和文件加载。
+已经支持基本读写、镜像大小检查、默认布局和运行时 `base/size` 布局，也可以在指定地址装载、清零或为 DMA 复制任意长度字节。普通总线读写只接受 1、2、4、8 字节；地址转换、长度相加和切片范围都经过检查。失败访问会在修改内存前返回错误。单元测试覆盖全部合法宽度、非法宽度、整数溢出、部分越界和文件加载。
 
 ## 公共接口
 
 - `Dram { pub dram: Vec<u8>, pub base: u64 }`
-- `Dram::{new, with_layout, end, load, load_bytes, zero_range}`
+- `Dram::{new, with_layout, end, load, load_bytes, zero_range, read_bytes, write_bytes}`
 - `Default` 和 `MemDevice` 实现
 
 ## 依赖关系
 
-默认容量和基址来自 `cfg`，错误类型为 `trap::Exception`。命令行程序通过 `Platform` 创建并挂载 DRAM；测试平台没有复用该类型，而是维护自己的 RAM 向量。
+默认容量和基址来自 `cfg`，错误类型为 `trap::Exception`。`Platform` 通过 `Shared<Dram>` 创建并挂载主存；正式 virtio-blk 使用同一共享对象执行 DMA，测试不再维护独立 RAM 向量。
 
 ## 已知问题与改进建议
 

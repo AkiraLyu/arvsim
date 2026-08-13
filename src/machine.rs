@@ -3,18 +3,20 @@
 //! [`Platform`] 在 CPU 创建前持有 DRAM 和待挂载设备，统一检查物理区域并完成总线组装。
 //! [`Machine`] 作为唯一运行入口，按同一平台周期推进设备与 CPU，并统一处理复位和连续执行。
 
-use crate::bus::{Bus, MemDevice};
+use crate::bus::{Bus, BusError, MemDevice, Shared};
 use crate::cpu::{CYCLES_PER_STEP, Cpu};
 use crate::dram::Dram;
 use crate::trap::Exception;
 use crate::uart::Uart;
+use std::cell::{Ref, RefMut};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 pub use crate::cpu::DebugLevel;
 
 const RESET_VECTOR_ALIGNMENT: u64 = 2;
-const STACK_ALIGNMENT: u64 = 16;
+/// RISC-V psABI 要求的栈指针对齐字节数。
+pub const STACK_ALIGNMENT: u64 = 16;
 
 /// [`Machine::run`] 的停止条件和调试配置。
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq)]
@@ -30,7 +32,9 @@ pub struct RunOptions {
 pub enum RunOutcome {
     /// 已成功执行指定步数，CPU 状态停在下一条指令之前。
     StepLimitReached { steps: u64 },
-    /// 遇到未被 guest trap 入口接管的异常。
+    /// CPU 上报了无法继续运行的致命异常。
+    ///
+    /// 当前 CPU 会把所有架构异常交给 guest trap 入口，因此该分支为未来的宿主级致命错误保留。
     Exception {
         /// 异常前已成功完成的步数。
         steps: u64,
@@ -61,6 +65,8 @@ pub enum PlatformError {
     ResetVectorOutsideDram { reset_vector: u64 },
     /// CPU 复位向量不满足当前 16 位指令对齐要求。
     ResetVectorMisaligned { reset_vector: u64 },
+    /// 对齐后的初始栈指针落在 DRAM 基址之前。
+    InitialStackOutsideDram { initial_sp: u64 },
 }
 
 impl Display for PlatformError {
@@ -81,17 +87,30 @@ impl Display for PlatformError {
             Self::ResetVectorMisaligned { reset_vector } => {
                 write!(f, "reset vector {reset_vector:#x} is not 2-byte aligned")
             }
+            Self::InitialStackOutsideDram { initial_sp } => {
+                write!(f, "initial stack pointer {initial_sp:#x} is outside DRAM")
+            }
         }
     }
 }
 
 impl Error for PlatformError {}
 
+impl From<BusError> for PlatformError {
+    fn from(error: BusError) -> Self {
+        match error {
+            BusError::EmptyRegion => Self::EmptyDeviceRegion,
+            BusError::AddressOverflow => Self::AddressOverflow,
+            BusError::RegionOverlap { base, end } => Self::RegionOverlap { base, end },
+        }
+    }
+}
+
 /// 尚未创建 CPU 的平台地址空间。
 ///
 /// 镜像应通过 [`Platform::dram_mut`] 装载；设备必须在 [`Platform::build`] 前完成挂载。
 pub struct Platform {
-    dram: Dram,
+    dram: Shared<Dram>,
     dram_end: u64,
     devices: Vec<MappedDevice>,
 }
@@ -107,20 +126,25 @@ impl Platform {
             .checked_add(size)
             .ok_or(PlatformError::AddressOverflow)?;
         Ok(Self {
-            dram: Dram::with_layout(dram_base, dram_size),
+            dram: Shared::new(Dram::with_layout(dram_base, dram_size)),
             dram_end,
             devices: Vec::new(),
         })
     }
 
     /// 返回平台主存，供镜像装载器读取布局。
-    pub fn dram(&self) -> &Dram {
-        &self.dram
+    pub fn dram(&self) -> Ref<'_, Dram> {
+        self.dram.borrow()
     }
 
     /// 返回平台主存的可变引用；CPU 创建后应改由总线访问内存。
-    pub fn dram_mut(&mut self) -> &mut Dram {
-        &mut self.dram
+    pub fn dram_mut(&self) -> RefMut<'_, Dram> {
+        self.dram.borrow_mut()
+    }
+
+    /// 返回与平台主存指向同一对象的共享句柄，供正式 DMA 设备使用。
+    pub fn dram_handle(&self) -> Shared<Dram> {
+        self.dram.clone()
     }
 
     /// 挂载一个通用 MMIO 设备。
@@ -138,7 +162,8 @@ impl Platform {
         let end = base
             .checked_add(size)
             .ok_or(PlatformError::AddressOverflow)?;
-        let overlaps_dram = ranges_overlap(base, end, self.dram.base, self.dram_end);
+        let dram_base = self.dram.borrow().base;
+        let overlaps_dram = ranges_overlap(base, end, dram_base, self.dram_end);
         let overlaps_device = self
             .devices
             .iter()
@@ -150,28 +175,31 @@ impl Platform {
         Ok(())
     }
 
-    /// 挂载正式库中的简化 UART。
+    /// 挂载使用标准输出后端的正式 UART。
     pub fn attach_uart(&mut self, base: u64) -> Result<(), PlatformError> {
         self.attach_device(base, crate::cfg::UART_SIZE, Box::new(Uart::new(base)))
     }
 
     /// 验证复位向量并完成总线、CPU、时钟状态和中断源的组装。
     pub fn build(self, reset_vector: u64) -> Result<Machine, PlatformError> {
-        if !(self.dram.base..self.dram_end).contains(&reset_vector) {
+        let dram_base = self.dram.borrow().base;
+        if !(dram_base..self.dram_end).contains(&reset_vector) {
             return Err(PlatformError::ResetVectorOutsideDram { reset_vector });
         }
         if reset_vector & (RESET_VECTOR_ALIGNMENT - 1) != 0 {
             return Err(PlatformError::ResetVectorMisaligned { reset_vector });
         }
 
-        let dram_base = self.dram.base;
         let dram_size = self.dram_end - dram_base;
         // RISC-V psABI 要求栈指针保持 16 字节对齐；向下取整可确保栈顶不越过 DRAM 末端。
         let initial_sp = self.dram_end & !(STACK_ALIGNMENT - 1);
+        if initial_sp < dram_base {
+            return Err(PlatformError::InitialStackOutsideDram { initial_sp });
+        }
         let mut bus = Bus::new();
-        bus.attach_device(dram_base, dram_size, Box::new(self.dram));
+        bus.attach_device(dram_base, dram_size, Box::new(self.dram))?;
         for region in self.devices {
-            bus.attach_device(region.base, region.size, region.dev);
+            bus.attach_device(region.base, region.size, region.dev)?;
         }
 
         Ok(Machine::from_address_space(
@@ -214,12 +242,13 @@ impl Machine {
     /// 推进一个机器步骤。
     ///
     /// 设备先观察本步经过的平台周期，再由 CPU 更新时间、查询中断并执行或进入 trap。
+    /// 当前所有架构异常都会在 CPU 内转入 guest trap，错误通道为未来的致命错误保留。
     pub fn step(&mut self) -> Result<(), Exception> {
         self.cpu.bus.tick(CYCLES_PER_STEP);
         self.cpu.step()
     }
 
-    /// 重复调用 [`Machine::step`]，直到达到步数上限或出现未处理异常。
+    /// 重复调用 [`Machine::step`]，直到达到步数上限或 CPU 上报致命错误。
     pub fn run(&mut self, options: RunOptions) -> RunOutcome {
         let mut steps = 0;
         loop {
@@ -257,6 +286,7 @@ fn ranges_overlap(lhs_start: u64, lhs_end: u64, rhs_start: u64, rhs_end: u64) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trap::{InterruptCause, InterruptSet};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -271,8 +301,8 @@ mod tests {
             Err(Exception::StoreAMOAccessFault(addr))
         }
 
-        fn pending_interrupt(&mut self) -> Option<u64> {
-            Some((1 << 63) | 9)
+        fn pending_interrupts(&mut self) -> InterruptSet {
+            InterruptSet::from_cause(InterruptCause::SupervisorExternal)
         }
     }
 
@@ -293,8 +323,12 @@ mod tests {
             Err(Exception::StoreAMOAccessFault(addr))
         }
 
-        fn pending_interrupt(&mut self) -> Option<u64> {
-            (self.0.borrow().cycles > 0).then_some((1 << 63) | 9)
+        fn pending_interrupts(&mut self) -> InterruptSet {
+            if self.0.borrow().cycles > 0 {
+                InterruptSet::from_cause(InterruptCause::SupervisorExternal)
+            } else {
+                InterruptSet::EMPTY
+            }
         }
 
         fn reset(&mut self) {
@@ -396,6 +430,12 @@ mod tests {
 
         assert_eq!(machine.cpu.registers[2], base + 0x20);
         assert_eq!(machine.cpu.registers[2] & 0xf, 0);
+
+        let platform = Platform::new(base + 4, 8).unwrap();
+        assert!(matches!(
+            platform.build(base + 4),
+            Err(PlatformError::InitialStackOutsideDram { initial_sp }) if initial_sp == base
+        ));
     }
 
     #[test]
@@ -406,6 +446,9 @@ mod tests {
             .unwrap();
         let mut machine = platform.build(0x8000_0000).unwrap();
 
-        assert_eq!(machine.cpu.bus.pending_interrupt(), Some((1 << 63) | 9));
+        assert_eq!(
+            machine.cpu.bus.pending_interrupts(),
+            InterruptSet::from_cause(InterruptCause::SupervisorExternal)
+        );
     }
 }

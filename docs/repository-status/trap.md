@@ -1,26 +1,27 @@
-# `src/trap.rs`：同步异常
+# `src/trap.rs`：异常与中断原因
 
 ## 功能与实现
 
-`Exception` 用枚举表示取指、访存、非法指令、断点、U/S/M 环境调用和页错误，并携带相关地址、PC 或原始指令。`cause()` 统一生成 `mcause/scause` 的异常原因码，`value()` 统一生成 `mtval/stval` 的附加值。异常路由和状态切换由 CPU 完成。
+`Exception` 用枚举表示取指、访存、非法指令、断点、U/S/M 环境调用和页错误，并携带相关地址、PC 或原始指令。`InterruptCause` 单独表示六种当前支持的标准软件、定时器和外部中断；`InterruptSet` 表示一个或多个同时有效的 `mip` 位。`INTERRUPT_FLAG` 只用于最终的 `mcause/scause` 编码。异常与中断路由及状态切换由 CPU 完成。
 
 ## 实现状态
 
-枚举覆盖当前执行核心会产生的同步异常。环境调用会按当前特权级构造对应成员；CPU 再根据 `MEDELEG` 选择机器或监督模式入口。中断仍由总线返回带中断标志的 `u64` 原因值，不使用本枚举。
+同步异常枚举覆盖当前执行核心会产生的原因。加载地址未对齐使用与规范一致的 `LoadAddrMisaligned` 名称；`IllegalInstruction` 同时表示不支持的编码和当前特权级或陷阱设置不允许执行的指令。环境调用会按当前特权级构造对应成员；CPU 再根据 `MEDELEG` 选择机器或监督模式入口。设备和总线只传递 `InterruptSet`，不会把最终 trap 编码或最高位标志混入设备协议。
 
 ## 公共接口
 
 - `Exception`，派生 `Debug`、`Copy`、`Clone`、`PartialEq` 和 `Eq`。
 - `Exception::cause() -> u64`。
 - `Exception::value() -> u64`。
+- `InterruptCause::{code, mask, encoded}`。
+- `InterruptSet::{EMPTY, from_cause, bits, insert, merge, contains, is_empty}`。
+- `INTERRUPT_FLAG`。
 
 ## 依赖关系
 
-`MemDevice` 以 `Exception` 作为读写错误类型；DRAM、UART、总线、CPU、指令执行和测试设备都会构造相应成员。CPU 使用 `cause/value` 写入机器或监督模式异常 CSR。
+`MemDevice` 以 `Exception` 作为读写错误类型，并通过 `InterruptSet` 报告中断。CPU 使用异常 `cause/value` 或中断 `encoded` 写入机器或监督模式 trap CSR；PLIC 使用 `InterruptCause` 配置上下文输出。
 
 ## 已知问题与改进建议
 
 - 没有实现 `Display` 和 `std::error::Error`，宿主调用方只能使用调试格式。
-- UART 仍用 `IllegalInstruction` 表示未知寄存器，错误含义不准确。
-- 异常与中断没有统一为 `Trap` 类型；设备中断接口仍直接传递未经封装的 `u64`。
-- 后续可增加独立的 `Interrupt` 和 `Trap`，并把设备寄存器错误改为访问错误或专用设备错误。
+- 异常与中断尚未统一为一个 `Trap` 类型；宿主级致命错误也仍复用 `Exception` 通道。

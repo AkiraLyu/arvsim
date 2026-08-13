@@ -103,6 +103,7 @@ pub const MASK_SSTATUS: u64 = MASK_SIE
     | MASK_SPIE
     | MASK_UBE
     | MASK_SPP
+    | MASK_VS
     | MASK_FS
     | MASK_XS
     | MASK_SUM
@@ -121,7 +122,7 @@ pub const MASK_MEIP: u64 = 1 << 11;
 /// 本实现支持的机器中断位。
 pub const MASK_INTERRUPTS: u64 =
     MASK_SSIP | MASK_MSIP | MASK_STIP | MASK_MTIP | MASK_SEIP | MASK_MEIP;
-/// `mip` 中由机器模式软件直接写入的中断位。
+/// `mip` 中始终可由机器模式软件直接写入的中断位。
 pub const MASK_MIP_WRITABLE: u64 = MASK_SSIP | MASK_SEIP;
 /// 可委托到监督模式的中断位。
 pub const MASK_MIDELEG: u64 = MASK_SSIP | MASK_STIP | MASK_SEIP;
@@ -160,12 +161,13 @@ const MASK_SSTATUS_WRITABLE: u64 = MASK_SIE | MASK_SPIE | MASK_SPP | MASK_SUM | 
 const MSTATUS_XLEN: u64 = (0b10 << 32) | (0b10 << 34);
 const PMPADDR_MASK: u64 = (1 << 54) - 1;
 const PMP_CONFIGS_PER_CSR: usize = 8;
-const PMP_CFG_READ: u8 = 1 << 0;
-const PMP_CFG_WRITE: u8 = 1 << 1;
-const PMP_CFG_EXECUTE: u8 = 1 << 2;
-const PMP_CFG_LOCKED: u8 = 1 << 7;
-const PMP_CFG_ADDRESS_MASK: u8 = 0b11 << 3;
-const PMP_CFG_TOR: u8 = 0b01 << 3;
+pub(crate) const PMP_CFG_READ: u8 = 1 << 0;
+pub(crate) const PMP_CFG_WRITE: u8 = 1 << 1;
+pub(crate) const PMP_CFG_EXECUTE: u8 = 1 << 2;
+pub(crate) const PMP_CFG_ADDRESS_SHIFT: u32 = 3;
+pub(crate) const PMP_CFG_ADDRESS_MASK: u8 = 0b11 << PMP_CFG_ADDRESS_SHIFT;
+pub(crate) const PMP_CFG_LOCKED: u8 = 1 << 7;
+const PMP_CFG_TOR: u8 = 0b01 << PMP_CFG_ADDRESS_SHIFT;
 const PMP_CFG_WRITABLE_MASK: u8 =
     PMP_CFG_READ | PMP_CFG_WRITE | PMP_CFG_EXECUTE | PMP_CFG_ADDRESS_MASK | PMP_CFG_LOCKED;
 
@@ -212,10 +214,22 @@ impl Csr {
             MIE => self.csrs[MIE] = value & MASK_INTERRUPTS,
             MTVEC | STVEC => self.csrs[addr] = sanitize_tvec(value),
             MCOUNTEREN | SCOUNTEREN => self.csrs[addr] = value & MASK_COUNTEREN_TM,
-            MENVCFG => self.csrs[MENVCFG] = value & MASK_STCE,
+            MENVCFG => {
+                let old_stce = self.csrs[MENVCFG] & MASK_STCE;
+                let new_stce = value & MASK_STCE;
+                if old_stce == 0 && new_stce != 0 {
+                    // Sstc 生效后 STIP 改由 stimecmp 驱动，旧的软件置位不能继续保留。
+                    self.csrs[MIP] &= !MASK_STIP;
+                }
+                self.csrs[MENVCFG] = new_stce;
+            }
             MEPC | SEPC => self.csrs[addr] = value & !1,
             MIP => {
-                self.csrs[MIP] = (self.csrs[MIP] & !MASK_MIP_WRITABLE) | (value & MASK_MIP_WRITABLE)
+                let mut writable = MASK_MIP_WRITABLE;
+                if self.csrs[MENVCFG] & MASK_STCE == 0 {
+                    writable |= MASK_STIP;
+                }
+                self.csrs[MIP] = (self.csrs[MIP] & !writable) | (value & writable)
             }
             SIE => {
                 self.csrs[MIE] =
@@ -439,6 +453,23 @@ mod tests {
 
         csr.update_pending(0);
         assert_eq!(csr.load(MIP), MASK_SSIP);
+    }
+
+    #[test]
+    fn stip_is_software_writable_only_while_sstc_is_disabled() {
+        let mut csr = Csr::new();
+
+        csr.store(MIP, MASK_STIP);
+        assert_eq!(csr.load(MIP) & MASK_STIP, MASK_STIP);
+
+        csr.store(MENVCFG, MASK_STCE);
+        assert_eq!(csr.load(MIP) & MASK_STIP, 0);
+        csr.store(MIP, MASK_STIP);
+        assert_eq!(csr.load(MIP) & MASK_STIP, 0);
+
+        csr.store(MENVCFG, 0);
+        csr.store(MIP, MASK_STIP);
+        assert_eq!(csr.load(MIP) & MASK_STIP, MASK_STIP);
     }
 
     #[test]
