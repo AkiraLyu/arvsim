@@ -97,12 +97,29 @@ impl Display for DmaError {
 impl Error for DmaError {}
 
 /// 可被设备 DMA 的 guest 物理内存。
+/// 验证方法不得读写内存；一次读写失败时不得留下部分写入。
 pub trait GuestMemory {
+    fn validate_read(&self, addr: u64, len: usize) -> Result<(), DmaError>;
+    fn validate_write(&self, addr: u64, len: usize) -> Result<(), DmaError>;
     fn read(&mut self, addr: u64, output: &mut [u8]) -> Result<(), DmaError>;
     fn write(&mut self, addr: u64, input: &[u8]) -> Result<(), DmaError>;
 }
 
 impl GuestMemory for Shared<Dram> {
+    fn validate_read(&self, addr: u64, len: usize) -> Result<(), DmaError> {
+        self.borrow()
+            .contains_range(addr, len)
+            .then_some(())
+            .ok_or(DmaError::Read(addr))
+    }
+
+    fn validate_write(&self, addr: u64, len: usize) -> Result<(), DmaError> {
+        self.borrow()
+            .contains_range(addr, len)
+            .then_some(())
+            .ok_or(DmaError::Write(addr))
+    }
+
     fn read(&mut self, addr: u64, output: &mut [u8]) -> Result<(), DmaError> {
         self.borrow()
             .read_bytes(addr, output)
@@ -513,112 +530,156 @@ impl VirtioBlock {
         }
     }
 
-    fn transfer(
-        &mut self,
+    fn validate_transfer(
+        &self,
         descriptors: &[Descriptor],
         disk_offset: u64,
         device_writes: bool,
-    ) -> Result<u32, BlockError> {
+    ) -> Result<(), BlockError> {
         let mut transfer_len = 0u64;
         for descriptor in descriptors {
             let writable = descriptor.flags & VIRTQ_DESC_F_WRITE != 0;
             if writable != device_writes {
                 return Err(BlockError::BackendFailure);
             }
-            transfer_len = transfer_len
-                .checked_add(u64::from(descriptor.len))
-                .ok_or(BlockError::OutOfRange)?;
+            if device_writes {
+                self.memory
+                    .validate_write(descriptor.addr, descriptor.len as usize)
+            } else {
+                self.memory
+                    .validate_read(descriptor.addr, descriptor.len as usize)
+            }
+            .map_err(|_| BlockError::BackendFailure)?;
+            transfer_len += u64::from(descriptor.len);
         }
-        let medium_size = self
-            .capacity_sectors
-            .checked_mul(BLOCK_SECTOR_SIZE)
-            .ok_or(BlockError::OutOfRange)?;
         let transfer_end = disk_offset
             .checked_add(transfer_len)
             .ok_or(BlockError::OutOfRange)?;
-        if transfer_end > medium_size {
+        // used.len 还要容纳一个状态字节；块请求的数据总量必须是扇区的整数倍。
+        if transfer_end > self.capacity_sectors * BLOCK_SECTOR_SIZE
+            || !transfer_len.is_multiple_of(BLOCK_SECTOR_SIZE)
+            || (device_writes && transfer_len >= u64::from(u32::MAX))
+        {
             return Err(BlockError::OutOfRange);
         }
-        let used_len = if device_writes {
-            u32::try_from(transfer_len)
-                .ok()
-                .and_then(|len| len.checked_add(1))
-                .ok_or(BlockError::OutOfRange)?
-        } else {
-            1
-        };
+        Ok(())
+    }
+
+    /// 返回请求状态和已写入数据区的连续前缀长度。
+    fn transfer(
+        &mut self,
+        descriptors: &[Descriptor],
+        disk_offset: u64,
+        device_writes: bool,
+    ) -> (u8, u32) {
+        if self
+            .validate_transfer(descriptors, disk_offset, device_writes)
+            .is_err()
+        {
+            return (VIRTIO_BLK_S_IOERR, 0);
+        }
 
         let mut transferred = 0u64;
+        let mut device_written = 0u32;
         let mut buffer = vec![0; TRANSFER_CHUNK_SIZE];
         for descriptor in descriptors {
             let mut remaining = u64::from(descriptor.len);
             let mut guest_addr = descriptor.addr;
             while remaining != 0 {
-                let chunk = usize::try_from(remaining.min(TRANSFER_CHUNK_SIZE as u64))
-                    .map_err(|_| BlockError::OutOfRange)?;
-                let backend_addr = disk_offset
-                    .checked_add(transferred)
-                    .ok_or(BlockError::OutOfRange)?;
-                if device_writes {
-                    self.backend.read_at(backend_addr, &mut buffer[..chunk])?;
-                    self.memory
-                        .write(guest_addr, &buffer[..chunk])
-                        .map_err(|_| BlockError::BackendFailure)?;
+                let chunk = remaining.min(TRANSFER_CHUNK_SIZE as u64) as usize;
+                let backend_addr = disk_offset + transferred;
+                let result = if device_writes {
+                    self.backend
+                        .read_at(backend_addr, &mut buffer[..chunk])
+                        .and_then(|()| {
+                            self.memory
+                                .write(guest_addr, &buffer[..chunk])
+                                .map_err(|_| BlockError::BackendFailure)
+                        })
                 } else {
                     self.memory
                         .read(guest_addr, &mut buffer[..chunk])
-                        .map_err(|_| BlockError::BackendFailure)?;
-                    self.backend.write_at(backend_addr, &buffer[..chunk])?;
+                        .map_err(|_| BlockError::BackendFailure)
+                        .and_then(|()| self.backend.write_at(backend_addr, &buffer[..chunk]))
+                };
+                if result.is_err() {
+                    return (VIRTIO_BLK_S_IOERR, device_written);
                 }
-                guest_addr = guest_addr
-                    .checked_add(chunk as u64)
-                    .ok_or(BlockError::OutOfRange)?;
-                transferred = transferred
-                    .checked_add(chunk as u64)
-                    .ok_or(BlockError::OutOfRange)?;
+                if device_writes {
+                    device_written += chunk as u32;
+                }
+                guest_addr += chunk as u64;
+                transferred += chunk as u64;
                 remaining -= chunk as u64;
             }
         }
-        Ok(used_len)
+        (VIRTIO_BLK_S_OK, device_written)
     }
 
     fn process_request(&mut self, head: u16) -> Result<RequestCompletion, DmaError> {
-        let chain = self.descriptor_chain(head)?;
-        if chain.len() < 2 {
+        let mut chain = self.descriptor_chain(head)?;
+        chain.retain(|descriptor| descriptor.len != 0);
+        let mut header_bytes = [0; 16];
+        let mut header_read = 0;
+        let mut seen_writable = false;
+        // Virtio 的消息边界独立于描述符边界：请求头可以拆分，数据也可以与头或状态共用描述符。
+        for descriptor in &mut chain {
+            let writable = descriptor.flags & VIRTQ_DESC_F_WRITE != 0;
+            if seen_writable && !writable {
+                return Err(DmaError::Read(descriptor.addr));
+            }
+            seen_writable |= writable;
+            if header_read < header_bytes.len() {
+                if writable {
+                    return Err(DmaError::Read(descriptor.addr));
+                }
+                let len = (descriptor.len as usize).min(header_bytes.len() - header_read);
+                self.memory.read(
+                    descriptor.addr,
+                    &mut header_bytes[header_read..header_read + len],
+                )?;
+                descriptor.addr = Self::checked_addr(descriptor.addr, len as u64)?;
+                descriptor.len -= len as u32;
+                header_read += len;
+            }
+        }
+        if header_read != header_bytes.len() {
             return Err(DmaError::Read(self.queue.descriptor_addr));
         }
-        let header = chain[0];
-        let status_descriptor = *chain.last().unwrap();
-        if header.flags & VIRTQ_DESC_F_WRITE != 0
-            || header.len < 16
-            || status_descriptor.flags & VIRTQ_DESC_F_WRITE == 0
-            || status_descriptor.len < 1
-        {
-            return Err(DmaError::Read(header.addr));
-        }
-        let header_bytes = self.read_memory::<16>(header.addr)?;
+        let last = chain
+            .last_mut()
+            .filter(|descriptor| descriptor.len > 0 && descriptor.flags & VIRTQ_DESC_F_WRITE != 0)
+            .ok_or(DmaError::Write(self.queue.descriptor_addr))?;
+        last.len -= 1;
+        let status_addr = Self::checked_addr(last.addr, u64::from(last.len))?;
+        chain.retain(|descriptor| descriptor.len != 0);
+        // 数据或介质写入前先检查完成记录，避免完成信息无法发布时仍产生 I/O。
+        self.memory.validate_write(status_addr, 1)?;
+        self.memory.validate_write(self.used_element_addr()?, 8)?;
+        self.memory
+            .validate_write(Self::checked_addr(self.queue.device_addr, 2)?, 2)?;
         let request_type = u32::from_le_bytes(header_bytes[0..4].try_into().unwrap());
         let sector = u64::from_le_bytes(header_bytes[8..16].try_into().unwrap());
         let disk_offset = sector
             .checked_mul(BLOCK_SECTOR_SIZE)
-            .ok_or(DmaError::AddressOverflow(header.addr))?;
-        let data = &chain[1..chain.len() - 1];
+            .ok_or(DmaError::AddressOverflow(self.queue.descriptor_addr))?;
+        let data = &chain;
 
-        let (status, written_len) = match request_type {
-            VIRTIO_BLK_T_IN => match self.transfer(data, disk_offset, true) {
-                Ok(written) => (VIRTIO_BLK_S_OK, written),
-                Err(_) => (VIRTIO_BLK_S_IOERR, 1),
-            },
-            VIRTIO_BLK_T_OUT => match self.transfer(data, disk_offset, false) {
-                Ok(written) => (VIRTIO_BLK_S_OK, written),
-                Err(_) => (VIRTIO_BLK_S_IOERR, 1),
-            },
-            _ => (VIRTIO_BLK_S_UNSUPP, 1),
+        let (status, data_written) = match request_type {
+            VIRTIO_BLK_T_IN => self.transfer(data, disk_offset, true),
+            VIRTIO_BLK_T_OUT => self.transfer(data, disk_offset, false),
+            _ => (VIRTIO_BLK_S_UNSUPP, 0),
         };
+        let writable_data_len: u64 = data
+            .iter()
+            .filter(|descriptor| descriptor.flags & VIRTQ_DESC_F_WRITE != 0)
+            .map(|descriptor| u64::from(descriptor.len))
+            .sum();
         Ok(RequestCompletion {
-            status_addr: status_descriptor.addr,
+            status_addr,
             status,
-            written_len,
+            // used.len 只能覆盖已初始化的连续前缀；数据未写完时，末尾状态字节不计入。
+            written_len: data_written + u32::from(u64::from(data_written) == writable_data_len),
         })
     }
 
@@ -629,12 +690,7 @@ impl VirtioBlock {
     ) -> Result<(), DmaError> {
         self.memory
             .write(completion.status_addr, &[completion.status])?;
-        let slot = self.queue.next_used_idx % self.queue.num;
-        let element_offset = u64::from(slot)
-            .checked_mul(8)
-            .and_then(|offset| offset.checked_add(4))
-            .ok_or(DmaError::AddressOverflow(self.queue.device_addr))?;
-        let element = Self::checked_addr(self.queue.device_addr, element_offset)?;
+        let element = self.used_element_addr()?;
         self.write_u32(element, u32::from(head))?;
         self.write_u32(Self::checked_addr(element, 4)?, completion.written_len)?;
         self.queue.next_used_idx = self.queue.next_used_idx.wrapping_add(1);
@@ -642,6 +698,11 @@ impl VirtioBlock {
             Self::checked_addr(self.queue.device_addr, 2)?,
             self.queue.next_used_idx,
         )
+    }
+
+    fn used_element_addr(&self) -> Result<u64, DmaError> {
+        let slot = self.queue.next_used_idx % self.queue.num;
+        Self::checked_addr(self.queue.device_addr, 4 + u64::from(slot) * 8)
     }
 
     fn process_available(&mut self) -> Result<bool, DmaError> {
@@ -803,6 +864,12 @@ mod tests {
     const HEADER: u64 = RAM_BASE + 0x4000;
     const DATA: u64 = RAM_BASE + 0x5000;
     const REQUEST_STATUS: u64 = RAM_BASE + 0x6000;
+    const DEVICE_CONFIG: VirtioBlockConfig = VirtioBlockConfig {
+        base: BASE,
+        size: 0x1000,
+        queue_size: 8,
+        vendor_id: 0x554d_4551,
+    };
 
     fn write_desc(dram: &Shared<Dram>, index: u64, descriptor: Descriptor) {
         let addr = DESC + index * 16;
@@ -819,12 +886,7 @@ mod tests {
         let disk = MemoryBlockBackend::new(vec![0x5a; 2 * BLOCK_SECTOR_SIZE as usize]);
         let line = InterruptLine::new();
         let device = VirtioBlock::new(
-            VirtioBlockConfig {
-                base: BASE,
-                size: 0x1000,
-                queue_size: 8,
-                vendor_id: 0x554d_4551,
-            },
+            DEVICE_CONFIG,
             Box::new(dram.clone()),
             Box::new(disk.clone()),
             line.clone(),
@@ -915,6 +977,84 @@ mod tests {
     }
 
     #[test]
+    fn request_fields_can_cross_or_share_descriptor_boundaries() {
+        for device_writes in [true, false] {
+            let (mut device, dram, disk, _) = device();
+            initialize(&mut device);
+            queue_read_request(&dram, 0, BLOCK_SECTOR_SIZE as u32);
+            if device_writes {
+                // 请求头分成 7 + 9 字节，数据与状态共用一个可写描述符。
+                write_desc(
+                    &dram,
+                    0,
+                    Descriptor {
+                        addr: HEADER,
+                        len: 7,
+                        flags: VIRTQ_DESC_F_NEXT,
+                        next: 1,
+                    },
+                );
+                write_desc(
+                    &dram,
+                    1,
+                    Descriptor {
+                        addr: HEADER + 7,
+                        len: 9,
+                        flags: VIRTQ_DESC_F_NEXT,
+                        next: 2,
+                    },
+                );
+                write_desc(
+                    &dram,
+                    2,
+                    Descriptor {
+                        addr: DATA,
+                        len: BLOCK_SECTOR_SIZE as u32 + 1,
+                        flags: VIRTQ_DESC_F_WRITE,
+                        next: 0,
+                    },
+                );
+            } else {
+                // OUT 的请求头和数据位于同一个只读描述符。
+                dram.borrow_mut()
+                    .write_bytes(HEADER, &VIRTIO_BLK_T_OUT.to_le_bytes())
+                    .unwrap();
+                dram.borrow_mut()
+                    .write_bytes(HEADER + 16, &[0x39; BLOCK_SECTOR_SIZE as usize])
+                    .unwrap();
+                write_desc(
+                    &dram,
+                    0,
+                    Descriptor {
+                        addr: HEADER,
+                        len: BLOCK_SECTOR_SIZE as u32 + 16,
+                        flags: VIRTQ_DESC_F_NEXT,
+                        next: 2,
+                    },
+                );
+            }
+            device.write(BASE + REG_QUEUE_NOTIFY, 0, 4).unwrap();
+            assert_eq!(dram.borrow_mut().read(USED + 2, 2), Ok(1));
+            if device_writes {
+                assert_eq!(dram.borrow_mut().read(DATA, 8), Ok(0x5a5a_5a5a_5a5a_5a5a));
+                assert_eq!(dram.borrow_mut().read(DATA + BLOCK_SECTOR_SIZE, 1), Ok(0));
+                assert_eq!(
+                    dram.borrow_mut().read(USED + 8, 4),
+                    Ok(BLOCK_SECTOR_SIZE + 1)
+                );
+            } else {
+                assert!(
+                    disk.bytes()[..BLOCK_SECTOR_SIZE as usize]
+                        .iter()
+                        .all(|byte| *byte == 0x39)
+                );
+                assert_eq!(dram.borrow_mut().read(REQUEST_STATUS, 1), Ok(0));
+                assert_eq!(dram.borrow_mut().read(USED + 8, 4), Ok(1));
+            }
+        }
+    }
+
+    #[test]
     fn modern_features_queue_completion_and_interrupt_follow_the_spec() {
         let (mut device, dram, _, line) = device();
         initialize(&mut device);
@@ -961,6 +1101,177 @@ mod tests {
     }
 
     #[test]
+    fn feature_negotiation_rejects_unoffered_bits() {
+        let (mut device, _, _, _) = device();
+        device.write(BASE + REG_DEVICE_FEATURES_SEL, 1, 4).unwrap();
+        assert_eq!(device.read(BASE + REG_DEVICE_FEATURES, 4), Ok(1));
+        device.write(BASE + REG_DRIVER_FEATURES_SEL, 1, 4).unwrap();
+        device.write(BASE + REG_DRIVER_FEATURES, 3, 4).unwrap();
+        device
+            .write(
+                BASE + REG_STATUS,
+                u64::from(
+                    STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK | STATUS_DRIVER_OK,
+                ),
+                4,
+            )
+            .unwrap();
+        assert_eq!(
+            device.device_status() & (STATUS_FEATURES_OK | STATUS_DRIVER_OK),
+            0
+        );
+    }
+
+    fn queue_two_buffer_read(dram: &Shared<Dram>, second: u64) {
+        queue_read_request(dram, 0, BLOCK_SECTOR_SIZE as u32);
+        write_desc(
+            dram,
+            2,
+            Descriptor {
+                addr: second,
+                len: BLOCK_SECTOR_SIZE as u32,
+                flags: VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE,
+                next: 3,
+            },
+        );
+        write_desc(
+            dram,
+            3,
+            Descriptor {
+                addr: REQUEST_STATUS,
+                len: 1,
+                flags: VIRTQ_DESC_F_WRITE,
+                next: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn all_data_and_completion_ranges_are_checked_before_io() {
+        for invalid_completion in [false, true] {
+            let (mut device, dram, _, _) = device();
+            initialize(&mut device);
+            queue_two_buffer_read(
+                &dram,
+                if invalid_completion {
+                    DATA + BLOCK_SECTOR_SIZE
+                } else {
+                    u64::MAX
+                },
+            );
+            if invalid_completion {
+                write_desc(
+                    &dram,
+                    3,
+                    Descriptor {
+                        addr: u64::MAX,
+                        len: 1,
+                        flags: VIRTQ_DESC_F_WRITE,
+                        next: 0,
+                    },
+                );
+            }
+            device.write(BASE + REG_QUEUE_NOTIFY, 0, 4).unwrap();
+            assert_eq!(dram.borrow_mut().read(DATA, 8), Ok(0));
+            assert_eq!(dram.borrow_mut().read(USED + 8, 4), Ok(0));
+            if invalid_completion {
+                assert_ne!(device.device_status() & STATUS_DEVICE_NEEDS_RESET, 0);
+                assert_eq!(dram.borrow_mut().read(USED + 2, 2), Ok(0));
+            } else {
+                assert_eq!(
+                    dram.borrow_mut().read(REQUEST_STATUS, 1),
+                    Ok(VIRTIO_BLK_S_IOERR.into())
+                );
+                assert_eq!(dram.borrow_mut().read(USED + 2, 2), Ok(1));
+            }
+        }
+    }
+
+    struct UnreadableSecondSector {
+        inner: MemoryBlockBackend,
+    }
+
+    impl BlockBackend for UnreadableSecondSector {
+        fn capacity_bytes(&self) -> u64 {
+            self.inner.capacity_bytes()
+        }
+        fn read_at(&mut self, offset: u64, output: &mut [u8]) -> Result<(), BlockError> {
+            if offset.saturating_add(output.len() as u64) > BLOCK_SECTOR_SIZE {
+                return Err(BlockError::BackendFailure);
+            }
+            self.inner.read_at(offset, output)
+        }
+        fn write_at(&mut self, _offset: u64, _input: &[u8]) -> Result<(), BlockError> {
+            Err(BlockError::BackendFailure)
+        }
+    }
+
+    struct RecordingMemory {
+        inner: Shared<Dram>,
+        writes: Rc<RefCell<Vec<(u64, usize)>>>,
+    }
+
+    impl GuestMemory for RecordingMemory {
+        fn validate_read(&self, addr: u64, len: usize) -> Result<(), DmaError> {
+            self.inner.validate_read(addr, len)
+        }
+        fn validate_write(&self, addr: u64, len: usize) -> Result<(), DmaError> {
+            self.inner.validate_write(addr, len)
+        }
+        fn read(&mut self, addr: u64, output: &mut [u8]) -> Result<(), DmaError> {
+            GuestMemory::read(&mut self.inner, addr, output)
+        }
+        fn write(&mut self, addr: u64, input: &[u8]) -> Result<(), DmaError> {
+            GuestMemory::write(&mut self.inner, addr, input)?;
+            self.writes.borrow_mut().push((addr, input.len()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn read_failure_reports_only_initialized_data() {
+        let dram = Shared::new(Dram::with_layout(RAM_BASE, 0x10_000));
+        let disk = MemoryBlockBackend::new(vec![0x5a; 2 * BLOCK_SECTOR_SIZE as usize]);
+        let writes = Rc::new(RefCell::new(Vec::new()));
+        let mut device = VirtioBlock::new(
+            DEVICE_CONFIG,
+            Box::new(RecordingMemory {
+                inner: dram.clone(),
+                writes: writes.clone(),
+            }),
+            Box::new(UnreadableSecondSector { inner: disk }),
+            InterruptLine::new(),
+        )
+        .unwrap();
+        initialize(&mut device);
+        queue_two_buffer_read(&dram, DATA + BLOCK_SECTOR_SIZE);
+        device.write(BASE + REG_QUEUE_NOTIFY, 0, 4).unwrap();
+
+        assert_eq!(
+            dram.borrow_mut().read(REQUEST_STATUS, 1),
+            Ok(VIRTIO_BLK_S_IOERR.into())
+        );
+        assert_eq!(dram.borrow_mut().read(USED + 2, 2), Ok(1));
+        let written = dram.borrow_mut().read(USED + 8, 4).unwrap() as usize;
+        let data_len = 2 * BLOCK_SECTOR_SIZE as usize;
+        assert!(written <= data_len + 1);
+        // 只验证已报告前缀确实经过 DMA 写入，不限定预读、分块、清零策略或实际完成量。
+        for offset in 0..written {
+            let addr = if offset == data_len {
+                REQUEST_STATUS
+            } else {
+                DATA + offset as u64
+            };
+            assert!(
+                writes
+                    .borrow()
+                    .iter()
+                    .any(|(start, len)| (*start..*start + *len as u64).contains(&addr))
+            );
+        }
+    }
+
+    #[test]
     fn memory_backend_replacement_keeps_the_advertised_capacity_stable() {
         let disk = MemoryBlockBackend::new(vec![0; 512]);
 
@@ -974,10 +1285,11 @@ mod tests {
 
     #[test]
     fn reset_preserves_media_but_clears_transport_state() {
-        let (mut device, _, disk, line) = device();
+        let (mut device, dram, disk, line) = device();
         initialize(&mut device);
-        device.interrupt_status = INTERRUPT_USED_BUFFER;
-        device.update_interrupt_line();
+        queue_read_request(&dram, 0, BLOCK_SECTOR_SIZE as u32);
+        device.write(BASE + REG_QUEUE_NOTIFY, 0, 4).unwrap();
+        assert!(line.is_asserted());
         device.write(BASE + REG_STATUS, 0, 4).unwrap();
 
         assert_eq!(device.read(BASE + REG_STATUS, 4), Ok(0));

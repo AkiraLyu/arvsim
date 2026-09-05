@@ -1,32 +1,21 @@
 # `src/virtio.rs`：Virtio MMIO 块设备
 
-规范基准：[Virtual I/O Device (VIRTIO) Version 1.2](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html)。
+实现 Virtio 1.2 现代 MMIO、64 位特性协商、单个分离式队列（split virtqueue）、块读写、完成状态、中断确认和复位。依据 [Virtio 1.2](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html)。
 
-## 功能与实现
+## 请求处理
 
-实现 Virtio 1.2 的现代 MMIO transport 和块设备子集：magic/version/device/vendor、64 位特性选择、设备状态与复位、单个 split virtqueue、32 位对齐的队列配置、available/used ring、描述符链、IN/OUT 块请求、请求状态、通知抑制、InterruptStatus/ACK，以及配置区的 64 位容量。
+- 检查队列参数、描述符索引、标志、循环、读写方向和扇区范围。
+- 请求字段与描述符边界独立：请求头可以分散在多个描述符中，数据可以与请求头或状态共用描述符。
+- 写入前检查所有数据区、状态字节及完成环记录。传输缓冲固定为 64 KiB，避免按客体长度分配大缓冲。
+- `used.len` 只报告已初始化的连续前缀。部分读盘失败时，末尾状态字节与有效数据之间仍有空洞，不能把状态字节计入前缀；规范允许少报写入量。
+- 完成操作只更新标准状态与完成环，不访问 xv6 驱动私有字段。
 
-设备始终提供 `VIRTIO_F_VERSION_1`，只接受已提供的 driver feature；只在 `DRIVER_OK` 且 QueueReady 时读取队列。描述符编号、保留标志、环增量、链循环、方向、地址运算、完整 32 位通知值、队列上限和广告介质范围均受检查。介质范围预检在 DMA 开始前完成，避免越界介质请求部分改写 guest 内存或介质；全部 guest DMA 范围尚未统一预检。guest 可控传输使用固定 64 KiB 暂存块分段执行，不会按描述符长度直接分配宿主内存。请求完成只更新标准状态字节和 used ring，不引用 xv6 的 `struct buf` 或其他驱动私有布局。
+设备始终提供 `VIRTIO_F_VERSION_1` 并拒绝未提供的特性。规范允许设备在驱动未接受 VERSION_1 时继续运行；当前保留这一行为，以兼容固定版本的 xv6 驱动。
 
-## 抽象边界
+## 接口与限制
 
-- `GuestMemory` 提供 DMA 读写；正式实现可直接使用 `Shared<Dram>`。
-- `BlockBackend` 提供稳定容量、随机读写和只读属性。
-- `MemoryBlockBackend` 是可共享的内存介质，只允许等容量替换内容。
-- `InterruptLine` 在 `InterruptStatus != 0` 时保持高电平，由 PLIC 处理 IRQ 编号和 claim/complete。
+`GuestMemory` 提供无副作用的 `validate_read/validate_write` 和 DMA 读写，单次失败不得留下部分写入；正式实现为 `Shared<Dram>`。`BlockBackend` 提供容量、只读属性及随机读写，`MemoryBlockBackend` 只允许等容量替换内容。
 
-## 公共接口
+测试覆盖普通完成、字段跨描述符、共享描述符、DMA 与完成元数据预检查、部分后端失败的前缀长度，以及中断和复位。故障由不可读扇区触发，报告前缀与实际 DMA 写入范围核对，不固定后端调用次数或传输分块大小。
 
-- `VirtioBlock::{new, base, size, device_status, interrupt_line}` 与 `MemDevice` 实现。
-- `VirtioBlockConfig`、`VirtioBlockError`。
-- `GuestMemory`、`DmaError`。
-- `BlockBackend`、`MemoryBlockBackend`、`BlockError`。
-- MMIO、块设备和扇区常量。
-
-## 已知限制
-
-- 只实现块设备和一个 split queue；未提供 packed ring、间接描述符、EVENT_IDX、多队列、discard、write-zeroes 或可变配置通知。
-- 队列通知同步处理所有当前 available 请求，没有异步时延或并行 I/O。
-- `MemoryBlockBackend` 适用于测试与嵌入；尚无正式文件后端和持久化错误恢复。
-- IN 请求的多个数据描述符中，若前段 DMA 写入成功而后段 guest 地址失败，设备会写入 `IOERR`，但 used length 固定为 1，没有包含已经写入的数据字节。
-- guest 违反描述符协议且无法定位标准状态字节时，设备设置 `DEVICE_NEEDS_RESET` 和配置变化中断；尚未覆盖所有恶意链组合的模糊测试。
+当前不支持 packed ring、间接描述符、EVENT_IDX、多队列、discard、write-zeroes、文件介质或异步 I/O。队列通知同步处理请求；无法定位有效完成信息时设置 `DEVICE_NEEDS_RESET`。
