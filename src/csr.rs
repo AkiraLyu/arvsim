@@ -190,8 +190,12 @@ impl Csr {
         }
     }
 
-    /// 读取 CSR；监督模式别名只暴露委托或允许可见的位。
+    /// 读取 CSR；未实现或超出 12 位地址空间时返回 0。
+    /// 指令执行前由 CPU 检查地址和权限，非法指令不会使用此默认值。
     pub fn load(&self, addr: usize) -> u64 {
+        if !Self::is_implemented(addr) {
+            return 0;
+        }
         match addr {
             // SIE/SIP 只能看到 MIDELEG 委托给监督模式的中断位。
             SIE => self.csrs[MIE] & self.csrs[MIDELEG],
@@ -204,8 +208,12 @@ impl Csr {
         }
     }
 
-    /// 写入 CSR；监督模式别名会合成到底层机器级寄存器。
+    /// 写入 CSR；监督模式别名合并到底层寄存器，未实现或越界地址不产生写入。
+    /// 此接口也供机器更新时间等硬件状态；指令权限检查由 CPU 负责。
     pub fn store(&mut self, addr: usize, value: u64) {
+        if !Self::is_implemented(addr) {
+            return;
+        }
         match addr {
             MSTATUS => self.csrs[MSTATUS] = sanitize_mstatus(value),
             MISA | MVENDORID | MARCHID | MIMPID | MHARTID | MCONFIGPTR => {}
@@ -490,6 +498,17 @@ mod tests {
         csr.store(SATP, (8 << 60) | 7);
         csr.store(SATP, (9 << 60) | 9);
         assert_eq!(csr.load(SATP), (8 << 60) | 7);
+    }
+
+    #[test]
+    fn unknown_host_addresses_do_not_panic_or_create_registers() {
+        let mut csr = Csr::new();
+        for addr in [0, PMPCFG0 + 1, NUM_CSRS, usize::MAX] {
+            csr.store(addr, u64::MAX);
+            assert_eq!(csr.load(addr), 0);
+            assert!(!Csr::is_implemented(addr));
+        }
+        assert_eq!(csr.load(MSTATUS), MSTATUS_XLEN);
     }
 
     #[test]

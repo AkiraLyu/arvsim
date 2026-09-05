@@ -44,6 +44,11 @@ pub trait MemDevice {
     fn read(&mut self, addr: u64, size: usize) -> Result<u64, Exception>;
     /// 向 `addr` 开始的 `size` 个字节写入 `value` 的低位部分。
     fn write(&mut self, addr: u64, value: u64, size: usize) -> Result<(), Exception>;
+    /// 返回包含该访问的保留区域版本；区域不得跨越物理页，写入后必须改变版本。
+    /// 默认设备不支持 LR/SC；RAM 应让 CPU 与 DMA 写入共用版本记录。
+    fn reservation_epoch(&mut self, _addr: u64, _size: usize) -> Option<u64> {
+        None
+    }
     /// 返回当前同时有效的 RISC-V 中断位；默认设备不产生中断。
     fn pending_interrupts(&mut self) -> InterruptSet {
         InterruptSet::EMPTY
@@ -55,6 +60,9 @@ pub trait MemDevice {
 }
 
 impl<T: MemDevice> MemDevice for Shared<T> {
+    fn reservation_epoch(&mut self, addr: u64, size: usize) -> Option<u64> {
+        self.borrow_mut().reservation_epoch(addr, size)
+    }
     fn read(&mut self, addr: u64, size: usize) -> Result<u64, Exception> {
         self.borrow_mut().read(addr, size)
     }
@@ -178,6 +186,9 @@ impl Bus {
 }
 
 impl MemDevice for Bus {
+    fn reservation_epoch(&mut self, addr: u64, size: usize) -> Option<u64> {
+        self.find_dev(addr, size)?.reservation_epoch(addr, size)
+    }
     fn read(&mut self, addr: u64, size: usize) -> Result<u64, Exception> {
         if let Some(dev) = self.find_dev(addr, size) {
             return dev.read(addr, size);

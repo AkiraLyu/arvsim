@@ -1,7 +1,7 @@
 //! RISC-V 平台级中断控制器（PLIC）。
 //!
-//! 实现覆盖规范定义的优先级、待处理位、目标使能、阈值和 claim/complete 流程。PLIC 规范
-//! 不规定 MMIO 地址布局，因此 [`PlicLayout`] 将常见的 SiFive/QEMU 布局显式参数化。
+//! 实现优先级、待处理位、目标使能、阈值和 claim/complete 流程。
+//! [`PlicLayout`] 默认采用 PLIC 1.0 的 MMIO 布局，也允许平台显式配置其他布局。
 
 use crate::bus::MemDevice;
 use crate::interrupt::InterruptLine;
@@ -101,7 +101,6 @@ pub struct Plic {
     active_sources: Vec<usize>,
     pending_sources: BTreeSet<usize>,
     gateway_busy: Vec<bool>,
-    claimed_by: Vec<Option<usize>>,
 }
 
 impl Plic {
@@ -220,7 +219,6 @@ impl Plic {
             active_sources: Vec::new(),
             pending_sources: BTreeSet::new(),
             gateway_busy: vec![false; slots],
-            claimed_by: vec![None; slots],
         })
     }
 
@@ -262,14 +260,11 @@ impl Plic {
         }
     }
 
-    fn eligible_source(&self, context: usize) -> Option<usize> {
+    fn eligible_source(&self, context: usize, threshold: u32) -> Option<usize> {
         self.pending_sources
             .iter()
             .copied()
-            .filter(|source| {
-                self.enabled[context][*source]
-                    && self.priorities[*source] > self.thresholds[context]
-            })
+            .filter(|source| self.enabled[context][*source] && self.priorities[*source] > threshold)
             .max_by(|left, right| {
                 self.priorities[*left]
                     .cmp(&self.priorities[*right])
@@ -280,24 +275,21 @@ impl Plic {
 
     fn claim(&mut self, context: usize) -> u32 {
         self.sync_gateways();
-        let Some(source) = self.eligible_source(context) else {
+        // 阈值只屏蔽通知；软件仍可通过 claim 轮询非零优先级的请求。
+        let Some(source) = self.eligible_source(context, 0) else {
             return 0;
         };
         self.pending[source] = false;
         self.pending_sources.remove(&source);
-        self.claimed_by[source] = Some(context);
         source as u32
     }
 
     fn complete(&mut self, context: usize, source: u32) {
         let source = source as usize;
-        if source == 0
-            || source >= self.claimed_by.len()
-            || self.claimed_by[source] != Some(context)
-        {
+        // PLIC 不跟踪 claim 的所有者，completion 只检查目标当前的使能位。
+        if source == 0 || source >= self.pending.len() || !self.enabled[context][source] {
             return;
         }
-        self.claimed_by[source] = None;
         self.gateway_busy[source] = false;
         // 电平源在完成时仍为高电平，应立即形成下一次待处理请求。
         self.sync_gateways();
@@ -432,7 +424,10 @@ impl MemDevice for Plic {
         self.sync_gateways();
         let mut result = InterruptSet::EMPTY;
         for (context, interrupt) in self.context_interrupts.iter().copied().enumerate() {
-            if self.eligible_source(context).is_some() {
+            if self
+                .eligible_source(context, self.thresholds[context])
+                .is_some()
+            {
                 result.insert(interrupt);
             }
         }
@@ -448,7 +443,6 @@ impl MemDevice for Plic {
         }
         self.thresholds.fill(0);
         self.gateway_busy.fill(false);
-        self.claimed_by.fill(None);
     }
 
     fn tick(&mut self, _cycles: u64) {
@@ -516,6 +510,46 @@ mod tests {
         assert_eq!(plic.read(BASE + 0x201004, 4), Ok(10));
         source.deassert();
         plic.write(BASE + 0x201004, 10, 4).unwrap();
+        assert_eq!(plic.read(BASE + 0x201004, 4), Ok(0));
+    }
+
+    #[test]
+    fn claim_ignores_threshold_but_excludes_disabled_and_zero_priority_sources() {
+        let mut plic = plic();
+        for source in 1..=3 {
+            plic.source_line(source).unwrap().assert();
+        }
+        plic.write(BASE + 4, 2, 4).unwrap();
+        plic.write(BASE + 8, 7, 4).unwrap();
+        plic.write(BASE + 0x2080, (1 << 1) | (1 << 3), 4).unwrap();
+        plic.write(BASE + 0x201000, 7, 4).unwrap();
+
+        assert!(plic.pending_interrupts().is_empty());
+        assert_eq!(plic.read(BASE + 0x201004, 4), Ok(1));
+        assert_eq!(plic.read(BASE + 0x201004, 4), Ok(0));
+        assert_eq!(plic.read(BASE + 0x1000, 4), Ok((1 << 2) | (1 << 3)));
+    }
+
+    #[test]
+    fn completion_uses_current_target_enable_instead_of_claim_ownership() {
+        let mut plic = plic();
+        plic.source_line(1).unwrap().assert();
+        plic.write(BASE + 4, 1, 4).unwrap();
+        plic.write(BASE + 0x2000, 1 << 1, 4).unwrap();
+        plic.write(BASE + 0x2080, 1 << 1, 4).unwrap();
+        assert_eq!(plic.read(BASE + 0x200004, 4), Ok(1));
+
+        // M 上下文 claim 后禁用此源，此时对 M 的 completion 必须被忽略。
+        plic.write(BASE + 0x2000, 0, 4).unwrap();
+        plic.write(BASE + 0x200004, 1, 4).unwrap();
+        assert_eq!(plic.read(BASE + 0x201004, 4), Ok(0));
+
+        // S 上下文仍启用此源，即使 claim 来自 M，也必须接受完成通知。
+        plic.write(BASE + 0x201004, 1, 4).unwrap();
+        assert_eq!(plic.read(BASE + 0x201004, 4), Ok(1));
+        for invalid in [0, 64, u32::MAX] {
+            plic.write(BASE + 0x201004, invalid.into(), 4).unwrap();
+        }
         assert_eq!(plic.read(BASE + 0x201004, 4), Ok(0));
     }
 

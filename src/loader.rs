@@ -16,6 +16,8 @@ const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 const EM_RISCV: u16 = 243;
 const PT_LOAD: u32 = 1;
+const PF_X: u32 = 1;
+const ET_EXEC: u16 = 2;
 
 /// 调用方要求或自动检测的镜像格式。
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -33,7 +35,7 @@ pub enum ImageFormat {
 pub struct LoadedImage {
     /// 实际采用的格式；不会是 [`ImageFormat::Auto`]。
     pub format: ImageFormat,
-    /// guest 的初始 PC。
+    /// 初始物理 PC；ELF 的虚拟入口按所在可执行段的装载地址转换。
     pub entry: u64,
     /// flat 文件长度或所有可装载 ELF 段的内存尺寸之和。
     pub loaded_bytes: u64,
@@ -124,11 +126,14 @@ fn load_elf64(dram: &mut Dram, bytes: &[u8]) -> Result<LoadedImage, LoadError> {
     if bytes[6] != 1 {
         return invalid("unsupported ELF identification version");
     }
+    if read_u16(bytes, 16)? != ET_EXEC || read_u32(bytes, 20)? != 1 {
+        return invalid("only ELF version 1 executables are supported");
+    }
     if read_u16(bytes, 18)? != EM_RISCV {
         return invalid("ELF machine is not RISC-V");
     }
 
-    let entry = read_u64(bytes, 24)?;
+    let virtual_entry = read_u64(bytes, 24)?;
     let phoff = to_usize(read_u64(bytes, 32)?, "program header offset")?;
     let phentsize = read_u16(bytes, 54)? as usize;
     let phnum = read_u16(bytes, 56)? as usize;
@@ -156,7 +161,8 @@ fn load_elf64(dram: &mut Dram, bytes: &[u8]) -> Result<LoadedImage, LoadError> {
     }
 
     let mut loaded_bytes = 0u64;
-    let mut load_segments = 0usize;
+    let mut segments = Vec::new();
+    let mut entry = None;
     for index in 0..phnum {
         let header = phoff + index * phentsize;
         if read_u32(bytes, header)? != PT_LOAD {
@@ -180,36 +186,44 @@ fn load_elf64(dram: &mut Dram, bytes: &[u8]) -> Result<LoadedImage, LoadError> {
         } else {
             physical_address
         };
-
-        dram.load_bytes(address, &bytes[file_offset..file_end])
-            .map_err(|error| {
-                LoadError::InvalidImage(format!("ELF segment does not fit DRAM: {error}"))
+        let virtual_end = virtual_address
+            .checked_add(memory_size as u64)
+            .ok_or_else(|| {
+                LoadError::InvalidImage("ELF virtual segment address overflows".into())
             })?;
-        if memory_size > file_size {
-            // 文件未携带的尾部对应 BSS，必须显式清零以得到 ELF 约定的初始状态。
-            let bss_address = address
-                .checked_add(file_size as u64)
-                .ok_or_else(|| LoadError::InvalidImage("ELF segment address overflow".into()))?;
-            dram.zero_range(bss_address, memory_size - file_size)
-                .map_err(|error| {
-                    LoadError::InvalidImage(format!("ELF segment BSS does not fit DRAM: {error}"))
-                })?;
+        if !dram.contains_range(address, memory_size) {
+            return invalid("ELF segment does not fit DRAM");
+        }
+        if read_u32(bytes, header + 4)? & PF_X != 0
+            && (virtual_address..virtual_end).contains(&virtual_entry)
+        {
+            let physical_entry = address + (virtual_entry - virtual_address);
+            if entry.is_some_and(|previous| previous != physical_entry) {
+                return invalid("ELF entry point has ambiguous physical mappings");
+            }
+            entry = Some(physical_entry);
         }
         loaded_bytes = loaded_bytes
             .checked_add(memory_size as u64)
             .ok_or_else(|| LoadError::InvalidImage("loaded byte count overflow".into()))?;
-        load_segments += 1;
+        segments.push((address, file_offset..file_end, memory_size));
     }
 
-    if load_segments == 0 {
+    if segments.is_empty() {
         return invalid("ELF image has no loadable segments");
     }
+    let entry = entry.ok_or_else(|| {
+        LoadError::InvalidImage("ELF entry point is outside executable load segments".into())
+    })?;
+    if entry & 1 != 0 {
+        return invalid("ELF entry point must be 2-byte aligned");
+    }
 
-    let dram_end = dram
-        .end()
-        .ok_or_else(|| LoadError::InvalidImage("DRAM address range overflows".into()))?;
-    if !(dram.base..dram_end).contains(&entry) {
-        return invalid("ELF entry point is outside DRAM");
+    // 完成全部布局检查后才修改 DRAM，避免后续坏段或非法入口留下半装载镜像。
+    for (address, file_range, memory_size) in segments {
+        let file_size = file_range.len();
+        dram.load_bytes(address, &bytes[file_range])?;
+        dram.zero_range(address + file_size as u64, memory_size - file_size)?;
     }
 
     Ok(LoadedImage {
@@ -271,6 +285,7 @@ mod tests {
 
         let ph = 64;
         elf[ph..ph + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        elf[ph + 4..ph + 8].copy_from_slice(&PF_X.to_le_bytes());
         elf[ph + 8..ph + 16].copy_from_slice(&0x100u64.to_le_bytes());
         elf[ph + 16..ph + 24].copy_from_slice(&0x8000_0000u64.to_le_bytes());
         elf[ph + 24..ph + 32].copy_from_slice(&0x8000_0000u64.to_le_bytes());
@@ -317,7 +332,7 @@ mod tests {
     fn mixed_physical_addresses_keep_a_legitimate_zero_address() {
         let mut elf = elf_with_segment();
         elf.resize(0x108, 0);
-        elf[24..32].copy_from_slice(&0u64.to_le_bytes());
+        elf[24..32].copy_from_slice(&0x1000u64.to_le_bytes());
         elf[56..58].copy_from_slice(&2u16.to_le_bytes());
 
         let first = 64;
@@ -337,6 +352,42 @@ mod tests {
         let mut dram = Dram::with_layout(0, 16);
         load_image_bytes(&mut dram, &elf, ImageFormat::Elf).unwrap();
         assert_eq!(&dram.dram[..8], &[0x93, 0x0f, 0xa0, 0x02, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn elf_entry_is_translated_from_an_executable_virtual_segment() {
+        let mut elf = elf_with_segment();
+        let virtual_base = 0xffff_ffff_8000_0000u64;
+        elf[24..32].copy_from_slice(&(virtual_base + 2).to_le_bytes());
+        elf[80..88].copy_from_slice(&virtual_base.to_le_bytes());
+        let mut dram = Dram::with_layout(0x8000_0000, 16);
+        let image = load_image_bytes(&mut dram, &elf, ImageFormat::Elf).unwrap();
+        assert_eq!(image.entry, 0x8000_0002);
+        assert_eq!(&dram.dram[..4], &elf[0x100..0x104]);
+    }
+
+    #[test]
+    fn invalid_elf_layout_or_entry_leaves_memory_unchanged() {
+        for failure in 0..5 {
+            let mut elf = elf_with_segment();
+            match failure {
+                0 => elf[68..72].copy_from_slice(&0u32.to_le_bytes()),
+                1 => elf[24..32].copy_from_slice(&0x8000_0008u64.to_le_bytes()),
+                2 => elf[24..32].copy_from_slice(&0x8000_0001u64.to_le_bytes()),
+                3 => elf[104..112].copy_from_slice(&17u64.to_le_bytes()),
+                _ => {
+                    // 第一段有效，第二段的文件区间截断；不能先装入第一段。
+                    elf[56..58].copy_from_slice(&2u16.to_le_bytes());
+                    let first = elf[64..120].to_vec();
+                    elf[120..176].copy_from_slice(&first);
+                    elf[128..136].copy_from_slice(&0x104u64.to_le_bytes());
+                }
+            }
+            let mut dram = Dram::with_layout(0x8000_0000, 16);
+            dram.dram.fill(0x5a);
+            assert!(load_image_bytes(&mut dram, &elf, ImageFormat::Elf).is_err());
+            assert_eq!(dram.dram, vec![0x5a; 16], "case {failure}");
+        }
     }
 
     #[test]

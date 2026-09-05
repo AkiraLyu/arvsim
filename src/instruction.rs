@@ -95,15 +95,11 @@ fn execute_load(cpu: &mut Cpu, inst: &Instruction) -> Result<(), Exception> {
     let virtual_addr = reg(cpu, inst.rs1).wrapping_add(imm_i(inst.raw));
     require_load_alignment(virtual_addr, size)?;
     let addr = cpu.translate_sized(virtual_addr, MemoryAccess::Load, size)?;
-    let value = match inst.funct3 {
-        0x0 => sign_extend(read_load(cpu, addr, virtual_addr, 1)?, 8),
-        0x1 => sign_extend(read_load(cpu, addr, virtual_addr, 2)?, 16),
-        0x2 => sign_extend(read_load(cpu, addr, virtual_addr, 4)?, 32),
-        0x3 => read_load(cpu, addr, virtual_addr, 8)?,
-        0x4 => read_load(cpu, addr, virtual_addr, 1)?,
-        0x5 => read_load(cpu, addr, virtual_addr, 2)?,
-        0x6 => read_load(cpu, addr, virtual_addr, 4)?,
-        _ => return Err(Exception::IllegalInstruction(inst.raw as u64)),
+    let value = read_load(cpu, addr, virtual_addr, size)?;
+    let value = if inst.funct3 < 0x4 {
+        sign_extend(value, (size * 8) as u32)
+    } else {
+        value
     };
     write_reg(cpu, inst.rd, value);
     Ok(())
@@ -121,13 +117,7 @@ fn execute_store(cpu: &mut Cpu, inst: &Instruction) -> Result<(), Exception> {
     require_store_alignment(virtual_addr, size)?;
     let addr = cpu.translate_sized(virtual_addr, MemoryAccess::Store, size)?;
     let value = reg(cpu, inst.rs2);
-    match inst.funct3 {
-        0x0 => write_mem(cpu, addr, virtual_addr, value, 1),
-        0x1 => write_mem(cpu, addr, virtual_addr, value, 2),
-        0x2 => write_mem(cpu, addr, virtual_addr, value, 4),
-        0x3 => write_mem(cpu, addr, virtual_addr, value, 8),
-        _ => Err(Exception::IllegalInstruction(inst.raw as u64)),
-    }
+    write_mem(cpu, addr, virtual_addr, value, size)
 }
 
 fn execute_op_imm(cpu: &mut Cpu, inst: &Instruction) -> Result<(), Exception> {
@@ -355,6 +345,9 @@ fn execute_amo(cpu: &mut Cpu, inst: &Instruction) -> Result<(), Exception> {
         cpu.clear_reservation();
         require_load_alignment(virtual_addr, width)?;
         let addr = cpu.translate_sized(virtual_addr, MemoryAccess::Load, width)?;
+        if !cpu.set_reservation(addr, width) {
+            return Err(Exception::LoadAccessFault(virtual_addr));
+        }
         let old_raw = cpu
             .bus
             .read(addr, width)
@@ -364,7 +357,6 @@ fn execute_amo(cpu: &mut Cpu, inst: &Instruction) -> Result<(), Exception> {
         } else {
             old_raw
         };
-        cpu.set_reservation(addr, width);
         write_reg(cpu, inst.rd, old);
         return Ok(());
     }

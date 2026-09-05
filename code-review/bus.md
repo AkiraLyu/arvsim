@@ -1,13 +1,7 @@
-# `src/bus.rs`：物理总线审查记录
+# 总线与内存审查记录
 
-> 本文属于代码审查报告（基线：提交 `17ad107` 的当前工作区，2026-08-12），只记录本轮审查结论；未改动实现代码。总览见 [README](./README.md)。对应的现状文档：[bus.md](/home/akira/codespace/arvsim/docs/repository-status/bus.md)。
+2026-09-05 复核了区域挂载、访问宽度、地址溢出、完整范围检查、中断合并、复位和周期推进。
 
-## 审查范围与总体判断
+本轮为 `MemDevice` 增加可选的 `reservation_epoch`，`Bus` 与 `Shared<T>` 转发到底层 DRAM，使 CPU 能观察 DMA 写入导致的 LR/SC 保留失效。默认设备不提供保留能力。DRAM 的多种访问共用范围检查，并限制外部直接修改字节向量。
 
-覆盖 `MemDevice` 生命周期、`Shared<T>`、设备区域挂载、宽度与完整范围检查、地址分发、中断集合合并和复位/时钟推进。零长度、溢出、重叠和部分越界均在产生设备副作用前拒绝，本轮未发现新增问题。
-
-共 0 条发现：高危 0、中危 0、低危 0。
-
-## 仍需保留的设计限制
-
-`Shared<T>` 使用 `Rc<RefCell<T>>`，运行时借用冲突会 panic，且不能跨线程使用；这是当前单线程平台的明确边界，已记录在状态文档和路线图中，不作为本轮新缺陷重复计数。
+`Shared<T>` 仍采用 `Rc<RefCell<T>>`，只适用于单线程，重叠的可变借用会产生运行时错误。这一限制属于公共使用约束，见 [总线](../docs/repository-status/bus.md)和 [DRAM](../docs/repository-status/dram.md) 文档。

@@ -6,13 +6,14 @@
 
 ## 实现状态
 
-地址分发和生命周期广播已经可用。总线只接受 1、2、4、8 字节访问，并检查地址加长度是否溢出，以及整个访问是否落在同一设备区域。挂载设备时会检查区域非空、地址溢出和区域重叠，并以 `BusError` 返回可恢复错误；找不到设备时分别返回读或写访问错误。`write` 接收 `u64`，因此 8 字节写只需一次设备调用。设备接口约定先验证完整访问，失败时不得留下部分写入或 MMIO 副作用。`reset` 和 `tick` 有默认空实现，现有 RAM 和同步设备无需维护空方法。
+地址分发、保留版本查询和生命周期广播已经可用。总线只接受 1、2、4、8 字节访问，并检查地址加长度是否溢出，以及整个访问是否落在同一设备区域。挂载设备时会检查区域非空、地址溢出和区域重叠，并以 `BusError` 返回可恢复错误；找不到设备时分别返回读或写访问错误。`write` 接收 `u64`，因此 8 字节写只需一次设备调用。设备接口约定先验证完整访问，失败时不得留下部分写入或 MMIO 副作用。`reset` 和 `tick` 有默认空实现，现有 RAM 和同步设备无需维护空方法。
 
 ## 公共接口
 
 - `MemDevice` 接口（Rust `trait`）
   - `read(&mut self, addr, size) -> Result<u64, Exception>`
   - `write(&mut self, addr, value: u64, size) -> Result<(), Exception>`
+  - `reservation_epoch(&mut self, addr, size) -> Option<u64>`，默认不支持 LR/SC；支持者须让 CPU 与 DMA 写入同步更新保留区域版本
   - `pending_interrupts(&mut self) -> InterruptSet`，默认没有中断
   - `reset(&mut self)`，默认不改变状态
   - `tick(&mut self, cycles)`，默认不推进状态

@@ -11,6 +11,7 @@ use crate::csr::{
     PMP_CFG_READ, PMP_CFG_WRITE,
 };
 use crate::instruction;
+use crate::paging::PAGE_SIZE;
 use crate::trap::{Exception, INTERRUPT_FLAG, InterruptCause};
 
 // 保留旧导入路径；运行控制本身由 `machine` 模块定义和实现。
@@ -33,7 +34,7 @@ pub struct Cpu {
     reset_vector: u64,
     initial_sp: u64,
     pc_written: bool,
-    reservation: Option<(u64, usize)>,
+    reservation: Option<(u64, usize, u64)>,
     xv6_accelerator: Option<Xv6Accelerator>,
 }
 
@@ -115,7 +116,7 @@ const XV6_PROC_STATE: u64 = 24;
 const XV6_PROC_CHAN: u64 = 32;
 const XV6_PROC_SLEEPING: u32 = 2;
 const XV6_PROC_RUNNABLE: u32 = 3;
-const XV6_PGSIZE: u64 = 4096;
+const XV6_PGSIZE: u64 = PAGE_SIZE;
 const XV6_MAXVA: u64 = 1 << 38;
 const XV6_PTE_V: u64 = 1 << 0;
 const XV6_PTE_R: u64 = 1 << 1;
@@ -309,12 +310,17 @@ impl Cpu {
         self.pc_written = true;
     }
 
-    pub(crate) fn set_reservation(&mut self, addr: u64, size: usize) {
-        self.reservation = Some((addr, size));
+    pub(crate) fn set_reservation(&mut self, addr: u64, size: usize) -> bool {
+        self.reservation = self
+            .bus
+            .reservation_epoch(addr, size)
+            .map(|epoch| (addr, size, epoch));
+        self.reservation.is_some()
     }
 
     pub(crate) fn take_reservation(&mut self) -> Option<(u64, usize)> {
-        self.reservation.take()
+        let (addr, size, epoch) = self.reservation.take()?;
+        (self.bus.reservation_epoch(addr, size) == Some(epoch)).then_some((addr, size))
     }
 
     pub(crate) fn clear_reservation(&mut self) {
@@ -1664,6 +1670,33 @@ mod tests {
         execute_raw(&mut cpu, sc_d);
         assert_eq!(cpu.registers[4], 1);
         assert_eq!(cpu.bus.read(addr, 8).unwrap(), replacement);
+    }
+
+    #[test]
+    fn dma_writes_invalidate_lr_sc_without_a_cpu_store() {
+        let mut memory = crate::bus::Shared::new(Dram::with_layout(BASE, MEMORY_SIZE));
+        let mut bus = crate::bus::Bus::new();
+        bus.attach_device(BASE, MEMORY_SIZE as u64, Box::new(memory.clone()))
+            .unwrap();
+        let mut cpu = Cpu::with_reset_vector(Box::new(bus), BASE, BASE + MEMORY_SIZE as u64);
+        let addr = BASE + 0x400;
+        cpu.registers[1] = addr;
+        cpu.registers[2] = 0x1234;
+        let lr = amo_raw(0x02, 3, 3, 1, 0);
+        let sc = amo_raw(0x03, 3, 4, 1, 2);
+
+        execute_raw(&mut cpu, lr);
+        crate::virtio::GuestMemory::write(&mut memory, addr, &42u64.to_le_bytes()).unwrap();
+        execute_raw(&mut cpu, sc);
+        assert_eq!(cpu.registers[4], 1);
+        assert_eq!(cpu.bus.read(addr, 8), Ok(42));
+
+        // 保留区域限制在一个物理页，另一页的 DMA 写入不影响该次 SC。
+        execute_raw(&mut cpu, lr);
+        crate::virtio::GuestMemory::write(&mut memory, addr + PAGE_SIZE, &[1]).unwrap();
+        execute_raw(&mut cpu, sc);
+        assert_eq!(cpu.registers[4], 0);
+        assert_eq!(cpu.bus.read(addr, 8), Ok(0x1234));
     }
 
     #[test]
