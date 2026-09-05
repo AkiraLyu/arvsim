@@ -1,17 +1,15 @@
-# `src/clint.rs`：CLINT 占位模块
+# `src/clint.rs`：尚未实现的 CLINT 模块
 
-## 实现状态
+目前只有模块说明和公开路径 `arvsim::clint`，没有类型、常量、寄存器实现或测试，也没有其他代码依赖它。
 
-目前只有模块说明和公开模块名，没有类型、常量、寄存器实现或测试。
+## 与现有定时器的区别
 
-## 公共接口
+当前计时和监督模式定时器比较由 `Cpu::tick/timer_is_pending` 完成。启用 `menvcfg.STCE` 后，CPU 比较 `TIME` 与 `STIMECMP`，把结果反映到 `MIP/SIP` 的硬件 `STIP` 位；关闭 STCE 后清除该硬件位。
 
-只有 `arvsim::clint` 模块路径，没有可调用项。
+这部分实现的是 Sstc 扩展。它没有 CLINT 的 MMIO 寄存器，也不会产生机器模式的软件中断 `MSIP` 或定时器中断 `MTIP`。
 
-## 依赖关系
+## 后续实现
 
-当前没有代码依赖。计时和监督模式定时器比较都直接写在 `Cpu::tick/timer_is_pending` 中，没有 MMIO CLINT。启用 `menvcfg.STCE` 后，CPU 比较 `TIME` 与 `STIMECMP`，并把结果作为硬件 `STIP` 映射到 `MIP/SIP`；关闭 STCE 后会清除该硬件待处理位。这属于 Sstc，不会产生 CLINT 应有的 `MSIP/MTIP` 信号。
+先确定目标平台使用传统 CLINT 还是 ACLINT 布局，再实现 `msip`、`mtime`、`mtimecmp` 或对应的独立设备。设备通过 `MemDevice::tick/reset` 参与机器的时钟更新和复位，并为每个硬件线程提供本地中断信号。CPU 负责接收信号并进入相应的中断处理程序。
 
-## 实现建议
-
-先确定目标平台使用传统 CLINT 地址布局还是 ACLINT。实现 `msip`、`mtime`、`mtimecmp` 或相应的拆分设备，通过 `MemDevice::tick/reset` 接入现有的 `Machine` 生命周期。CLINT 应为每个硬件线程提供明确的本地中断信号，CPU 只负责接收信号并进入机器模式中断入口。现有 `STIMECMP/STIP` 逻辑应作为 Sstc 单独保留，不能代替 CLINT。
+现有 `STIMECMP/STIP` 逻辑作为 Sstc 功能保留，不能代替 CLINT。

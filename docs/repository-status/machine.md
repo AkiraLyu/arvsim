@@ -1,39 +1,42 @@
-# `src/machine.rs`：机器与平台组装层
+# `src/machine.rs`：平台创建与机器运行
 
-## 功能与实现
+## 创建平台
 
-`Platform` 在创建 CPU 前保存共享 DRAM 和待挂载设备，并检查区域是否为空、地址是否溢出、MMIO 是否与 DRAM 或其他设备重叠。`build` 还要求复位向量位于 DRAM 且按 2 字节对齐，并将 DRAM 末端向下对齐到 16 字节后作为初始栈指针；若对齐结果落到 DRAM 基址之前则返回配置错误，随后才创建 `Bus` 和 `Machine`。`dram_handle` 允许 virtio 等正式 DMA 设备在平台构建前取得同一 DRAM 的共享句柄。
+`Platform` 保存共享 DRAM 和待添加的设备。创建 CPU 前，它会检查地址区域是否为空、地址计算是否溢出，以及 MMIO 区域是否与 DRAM 或其他设备重叠。
 
-`Machine` 是公开的运行入口。`reset` 先复位地址空间中的设备，再恢复 CPU；`step` 先让设备推进一个固定的 10 周期步长，再让 CPU 更新时间、查询中断并执行；`run` 反复调用 `Machine::step`，直到达到步数上限或 CPU 将来上报宿主级致命错误。当前所有架构异常都由 CPU 路由到 guest trap 入口，因此 `Machine::step` 的错误通道和 `RunOutcome::Exception` 只作为未来扩展点，不表示 guest 普通异常。`MemDevice` 的 `reset` 和 `tick` 默认不执行操作，因此 DRAM、纯同步设备和已有自定义地址空间可以保持原行为，需要易失状态或异步推进的设备则应覆盖对应方法。
+`build` 要求 CPU 复位地址位于 DRAM 内，并按 2 字节对齐。初始栈指针取 DRAM 结束地址，再向下调整到 16 字节对齐；如果结果小于 DRAM 起始地址，则返回配置错误。检查通过后才创建 `Bus` 和 `Machine`。总线添加设备时发现的错误也会返回给调用方。
 
-## 实现状态
+`dram_handle` 提供同一块 DRAM 的共享引用，让 Virtio 等 DMA 设备可以在平台构建前接入内存。
 
-地址空间组装、入口检查、栈对齐及其下界检查、共享 DRAM、设备生命周期和运行循环已经统一。命令行程序通过 `Platform` 创建 DRAM 和 UART；测试和 xv6 临时运行程序通过正式 `VirtPlatform` 创建 `Platform`、PLIC、UART 和 virtio-blk。所有路径均通过 `Machine::step` 推进。`Cpu::reset` 和 `Cpu::step` 只在 crate 内可见，CPU 自身不再提供连续运行循环，避免外部调用方绕过机器级设备推进。
+## 运行与复位
 
-`Platform::build` 会传播 `Bus` 挂载阶段返回的布局错误；公开挂载接口不再依靠进程异常退出表达失败。
+`Machine` 提供统一的运行入口：
 
-正式 UART 使用 `tick` 完成带参数的发送延迟；PLIC 在推进和查询时采样已连接电平线；virtio 队列通知当前同步完成。机器复位保留 DRAM 和块介质，同时清除 UART、PLIC 和 virtio transport 的易失状态。
+- `reset` 先复位设备，再复位 CPU。
+- `step` 先让设备按经过的 10 个周期更新状态，再由 CPU 更新时间、检查中断，并执行指令或进入异常、中断处理程序。
+- `run` 重复调用 `step`，直到达到步数上限，或收到执行错误。
 
-## 公共接口
+当前所有 RISC-V 异常都交给被模拟程序的异常处理入口，不会作为 `step` 的错误返回。`RunOutcome::Exception` 为将来无法继续运行的错误预留。
 
-- `Platform::{new, dram, dram_mut, dram_handle, attach_device, attach_uart, build}`；`dram` 与 `dram_mut` 返回共享借用守卫。
-- `PlatformError`：空区域、地址溢出、区域重叠、复位向量越界、复位向量未对齐和初始栈对齐后越过 DRAM 下界。
-- `Machine::from_address_space`：接入已经实现完整地址分发和生命周期协议的测试或自定义平台；`STACK_ALIGNMENT` 提供调用方计算初始栈所需的 psABI 对齐值。
-- `Machine::{reset, step, run}` 以及公开的 `cpu` 状态。
-- `DebugLevel`、`RunOptions`、`RunOutcome`；`DebugLevel` 的原始定义仍在 `cpu`，旧的 `cpu::{RunOptions, RunOutcome}` 路径保留为兼容重导出。
+命令行通过 `Platform` 创建 DRAM/UART 平台；xv6 测试和示例通过 `VirtPlatform` 创建包含 PLIC 和 Virtio 块设备的平台。它们都通过 `Machine::step` 运行。`Cpu::reset` 和 `Cpu::step` 仅在库内可见，外部调用方应使用 `Machine`，以保证设备状态也按时更新。
 
-## 依赖关系
+UART 通过 `tick` 模拟配置的发送延迟，PLIC 在时钟更新和中断查询时读取中断线电平。Virtio 当前在收到队列通知后同步处理请求。机器复位会保留 RAM 和磁盘内容，同时将 UART、PLIC 和 Virtio 的寄存器、队列配置及中断状态恢复到初始值。
 
-- `Platform` 依赖库中的 `Dram`、`Uart`、`Bus` 和 `MemDevice`。
-- `Machine` 依赖 `Cpu`，并通过 CPU 持有的地址空间调用 `MemDevice::{reset,tick}`。CPU 内部周期和设备周期目前都按每步 10 个周期推进。
-- 中断由 CPU 在每步设备推进后调用地址空间的 `pending_interrupts` 查询；总线合并所有设备同时有效的标准 `mip` 位。
-- `VirtPlatform` 和测试复用 `Platform`、`Bus`、`Dram`、`Uart`、PLIC 与 virtio-blk。
+## 公开接口
 
-## 已知限制
+- `Platform::{new, dram, dram_mut, dram_handle, attach_device, attach_uart, build}`。`dram` 和 `dram_mut` 返回带运行时借用检查的内存访问对象。
+- `PlatformError`：表示空区域、地址溢出、区域重叠、复位地址越界或未对齐，以及初始栈指针低于 DRAM 起点。
+- `Machine::from_address_space`：使用调用方提供的完整地址空间创建机器。
+- `STACK_ALIGNMENT`：RISC-V psABI 要求的初始栈对齐值。
+- `Machine::{reset, step, run}` 和公开的 `cpu` 状态。
+- `DebugLevel`、`RunOptions`、`RunOutcome`。`DebugLevel` 定义在 `cpu` 中；旧的 `cpu::{RunOptions, RunOutcome}` 导入路径仍可使用。
 
-- `Machine` 当前只支持一个硬件线程，每步固定推进 10 个周期；还没有独立于指令执行的事件调度或空闲时钟推进。
-- `MemDevice` 的生命周期方法默认为空。自定义设备若不实现 `reset`，其状态仍会跨机器复位保留；若不实现 `tick`，也不会随平台时钟推进。
-- `Machine::from_address_space` 是低层入口，不执行 `Platform` 的区域、复位向量和栈对齐检查，调用方必须自行保证这些约束。
-- `cpu` 字段仍公开，调用方可以直接修改寄存器、CSR 或总线状态；但外部代码不能直接调用 CPU 的复位、单步或连续运行接口。
-- 平台设备仍以 `Box<dyn MemDevice>` 挂载；`Shared<T>` 适合当前单线程模型，但运行时借用冲突会 panic，也不能直接用于多线程 hart。
-- DRAM 在平台创建时一次性分配，宿主机内存分配失败后无法恢复。
+## 依赖关系与限制
+
+`Platform` 使用 `Dram`、`Uart`、`Bus` 和 `MemDevice`。`Machine` 通过 CPU 持有的地址空间调用设备方法，总线负责合并各设备的中断位。
+
+当前只支持单个硬件线程和固定周期步长，没有独立的事件调度，也不会在 CPU 空闲时跳过等待时间。`MemDevice::reset/tick` 默认不做任何操作；自定义设备若需要复位或随时间变化，必须实现对应方法。
+
+`Machine::from_address_space` 不执行 `Platform` 的地址区域、复位地址和栈对齐检查，调用方需自行保证这些条件。`cpu` 字段仍公开，可直接修改寄存器、CSR 或总线状态。
+
+设备使用 `Box<dyn MemDevice>` 保存。`Shared<T>` 只适用于单线程，借用冲突会触发 Rust 的 `panic`。DRAM 在平台创建时一次性分配，主机内存分配失败后无法恢复。

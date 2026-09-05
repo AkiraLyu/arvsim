@@ -1,9 +1,13 @@
-# `src/loader.rs`：镜像装载
+# `src/loader.rs`：镜像加载
 
-装载器支持裸二进制和小端 RISC-V ELF64 可执行文件。裸二进制从 DRAM 基址开始装入；ELF 装入 `PT_LOAD` 段并清零 BSS。只有所有可装载段的 `p_paddr` 都为零时，才统一改用 `p_vaddr`。
+加载器支持原始二进制镜像（flat binary）和小端 RISC-V ELF64 可执行文件。原始二进制没有 ELF 头，内容从 DRAM 起始地址开始复制。ELF 则按 `PT_LOAD` 段加载数据，并把文件中没有数据的 BSS 区域清零。
 
-ELF 入口必须属于可执行段，并按该段的虚拟地址与物理装载地址转换为初始 PC。入口还须满足两字节对齐；有冲突的入口映射会被拒绝。段范围、文件范围、整数溢出和入口均在写入前检查，因此非法镜像不会留下部分装载内容。字段含义依据 [ELF 程序装载规范](https://gabi.xinuos.com/elf/07-pheader.html)。
+ELF 通常使用段的物理地址 `p_paddr` 作为加载位置。只有所有可加载段的 `p_paddr` 都为零时，才统一使用虚拟地址 `p_vaddr`。某一个段的物理地址为零，并不一定表示需要改用虚拟地址。
 
-公共接口为 `load_image`、`load_image_bytes`、`ImageFormat`、`LoadedImage` 和 `LoadError`。`LoadedImage.entry` 是物理入口；文件读取错误属于 `Io`，镜像布局错误属于 `InvalidImage`。
+ELF 入口必须位于可执行段中。加载器根据该段虚拟地址和实际加载地址的对应关系，计算初始物理 PC；入口还必须按 2 字节对齐。同一个入口若对应不同物理地址，会被拒绝。字段含义依据 [ELF 程序加载规范](https://gabi.xinuos.com/elf/07-pheader.html)。
 
-测试覆盖非恒等地址映射、物理地址零值、BSS、不可执行或未对齐入口，以及后续坏段导致的整体拒绝。当前不支持重定位、动态链接、符号解析或设备树；重叠装载段仍按程序头顺序写入，不提供通用进程装载语义。
+段地址、文件范围、整数溢出和入口都在修改内存前检查。任意检查失败时，整个加载操作失败，内存内容保持不变。
+
+公开接口为 `load_image`、`load_image_bytes`、`ImageFormat`、`LoadedImage` 和 `LoadError`。`LoadedImage.entry` 是初始物理 PC；文件读取错误返回 `Io`，镜像内容或布局错误返回 `InvalidImage`。
+
+测试覆盖虚拟地址与物理地址不同、物理地址为零、BSS 清零、入口不可执行或未对齐，以及后续段无效时内存不变的情况。当前不支持重定位、动态链接、符号解析或设备树。地址重叠的段按程序头顺序写入；模块不负责创建操作系统进程或进程地址空间。
