@@ -1,3 +1,7 @@
 # arvsim 仓库状态
 
-各模块的说明见 [`repository-status/README.md`](./repository-status/README.md)。文档已同步到 2026-08-12 的当前工作区代码（`main` 分支基线提交 `17ad107`，并包含尚未提交的实现与文档变更），内容包括模块功能、实现状态、公共接口、依赖关系、验证结果和未完成事项。2026-07-26 审查的 65 条问题已整改；当前复审仍有 11 条活动发现，见 [`../code-review/README.md`](../code-review/README.md)。
+文档记录 2026-09-05 在基线提交 `849ace2` 之上完成的本轮修复。
+
+- [模块总览](./repository-status/README.md)：功能、接口、依赖和限制。
+- [验证记录](./repository-status/verification.md)：本轮实际执行的检查与验收测试。
+- [审查与修复](../code-review/README.md)：确认的问题、修复方式和规范依据。

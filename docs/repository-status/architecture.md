@@ -1,32 +1,25 @@
 # 仓库结构与代码组成
 
-## 组成
+## 组成与职责
 
-- `src/` 同时构建 `arvsim` 库和命令行程序，主要由镜像装载器、`Platform`、`Machine` 和 CPU 解释器组成。
-- `tests/` 包含测试用例、镜像与符号工具，不再实现运行时设备。
-- `scripts/` 用于获取 xv6 源码、生成测试文件、运行测试和创建临时交互程序。
-- `Cargo.toml` 使用 Rust 2024 版，包版本为 `0.1.0`，不依赖第三方 Rust 库。
+- `src/` 提供库和主命令行程序，包括指令解释器、内存、设备、平台组装和镜像装载。
+- `src/paging.rs` 集中定义页大小、Sv39 页表位和编码函数；它是私有模块。
+- `src/cpu/xv6_accelerator.rs` 隔离可选的 xv6 内核加速，普通 CPU 默认关闭它。
+- `src/xv6.rs` 装载内核和磁盘，直接组装正式平台；仅加速模式依赖版本记录与内核符号。
+- `examples/xv6.rs` 提供交互式 xv6 运行入口，由启动脚本调用。
+- `tests/` 只构造测试输入、调用正式接口并断言结果，不实现设备、指令、ELF 解析或系统调用。
+- `scripts/` 获取和构建外部源码、编排测试及管理终端；`fixtures/xv6-revision` 保存默认 xv6 提交。
 
-## 实现状态
+包使用 Rust 2024 版，不依赖第三方 Rust 库。外部 xv6 镜像仍需 Git、交叉编译工具链及构建工具。
 
-命令行程序通过 `Platform` 检查 DRAM、MMIO 和复位向量，再创建 `Bus` 与 `Machine`。`VirtPlatform` 在该通用组装层上连接共享 DRAM、16550 UART、PLIC 和 virtio-blk。`Machine` 统一管理设备和 CPU 的复位、单步与连续运行：每个机器步骤先推进设备，再执行 CPU；连续运行、测试辅助代码和 xv6 临时运行程序都经过同一入口。CPU 的复位和单步接口只在 crate 内可见。地址空间、DMA、中断连线和运行生命周期均由正式库实现，测试不再复制设备逻辑。
+## 运行与依赖
 
-## 公共接口
+`Platform` 检查 DRAM、MMIO、入口和初始栈，再创建 `Bus` 与 `Machine`。`VirtPlatform` 在这一层上连接共享 DRAM、UART、PLIC 和 virtio-blk。`Machine::step` 先推进设备，再执行 CPU；`run` 复用同一入口。
 
-- Rust 库：`arvsim::{bus,cfg,clint,cpu,csr,dram,instruction,interrupt,loader,machine,plic,trap,uart,virt_platform,virtio}`。
-- 可执行程序：`cargo run -- [OPTIONS] <IMAGE>`，支持裸二进制/ELF64 镜像、运行限制、调试和 DRAM/UART 配置，见 [`main.md`](./main.md)。
-- 测试入口：`cargo test` 和 `scripts/run_testbench.sh`。
+CPU 通过 `MemDevice` 访问物理内存、查询中断与 LR/SC 保留版本。UART 和 Virtio 通过 `InterruptLine` 连接 PLIC；Virtio 通过 `GuestMemory` 访问共享 DRAM，通过 `BlockBackend` 访问块介质。DMA 和 CPU 写入使用同一内存写入接口，因此均能使保留失效。
 
-## 依赖关系
+普通镜像使用主命令行或 `Platform`。xv6 示例与测试共同调用 `Xv6Fixture::build`，无需包含测试源码或维护另一套设备。构建脚本与库共同读取固定提交文件；镜像目录保存实际提交和 SHA-256 清单。
 
-- 所有内存和 MMIO 错误统一依赖 `trap::Exception`。
-- `Dram::new`、命令行程序、部分 xv6 测试配置和 `VirtPlatformConfig::default` 会读取 `cfg` 中的默认地址；CPU 的 crate 内构造器由平台显式传入复位向量和栈指针。
-- 命令行程序的基础模式通过 `Platform::build` 创建 `Machine`；xv6 测试通过 `VirtPlatform::build` 使用相同的 `Platform`、`Bus`、`Dram`、`Uart` 和 `Machine`，并增加正式 PLIC 与 virtio-blk。
-- UART 和 virtio 通过 `InterruptLine` 连接 PLIC；virtio 通过 `GuestMemory` 访问共享 DRAM，通过 `BlockBackend` 访问介质。
+## 当前限制
 
-## 已知问题
-
-- `Machine` 已按固定的每步 10 周期推进设备，但没有独立事件队列、空闲时钟推进或高效跳时；UART 虽支持可配置发送延迟，其他设备仍同步处理。
-- CLINT/ACLINT 仍未接入；`virtio` 当前只提供块设备、单个 split queue 和内存后端。
-- `Platform` 和正式设备支持自定义 DRAM 地址与容量；xv6 加速器会接收实际 DRAM 范围，但仍与特定 xv6 数据结构和页大小耦合。
-- `target/testbench` 同时保存克隆的仓库、xv6 测试文件和生成代码。结果是否可复现仍取决于网络、上游分支和本机工具链。
+平台只有一个硬件线程，每步固定推进 10 个周期。设备同步执行，没有事件队列或空闲跳时；CLINT/ACLINT 尚未实现。xv6 内核加速依赖固定版本的结构布局，不能替代原始指令的符合性测试。完整限制见 [后续计划](./gaps-and-roadmap.md)。

@@ -19,5 +19,6 @@ pub mod trap;
 pub mod uart;
 pub mod virt_platform;
 pub mod virtio;
+pub mod xv6;
 
 mod paging;

@@ -1,49 +1,14 @@
-# `src/cpu.rs`：CPU 与 xv6 加速路径审查记录
+# CPU 与 xv6 加速审查与修复
 
-> 本文属于代码审查报告（基线：提交 `17ad107` 的当前工作区，2026-08-12），只记录本轮仍成立的审查发现与修改建议，未改动实现代码。总览见 [README](./README.md)。对应的现状文档：[cpu.md](/home/akira/codespace/arvsim/docs/repository-status/cpu.md)。
+2026-09-05 已修复加速器单步工作无上限的问题，并处理两项新增发现。
 
-## 审查范围与总体判断
+- CPU 原先只观察自己的存储，无法发现设备 DMA 修改 LR/SC 地址。DRAM 现在维护物理页版本，经总线查询；SC 检查版本后消费保留。同页 DMA 写入使保留失效，不同物理页写入不影响该保留。默认 MMIO 不支持保留。
+- xv6 加速移入私有子模块。内存、字符串操作每次最多处理 1 MiB，页表遍历和叶子映射分别最多 256 页，超限执行原始指令。`strlen` 扫描有界，`memmove` 缓冲有界，`freewalk` 在任何释放前检查整棵树。
+- 加速配置检查 DRAM、内核、全局对象、进程表和函数入口；正式装载器核验固定提交、源码和镜像。加速只在监督模式的 hart 0 生效。
+- 已删除根据 usertests 地址提前返回的用户态 `exec` 特例。所有用户态系统调用都执行原始指令并进入内核。
 
-覆盖 CPU 单步、异常与中断、PMP、Sv39、访存辅助和可选 xv6 快速路径。本轮重点复核上一轮整改后的地址运算、跨页访问、页表预检查和宿主分配。标准执行路径未发现新的高危问题；可选加速器仍允许一次机器单步执行由 guest 控制的无上限工作。
+加速测试已改为从 CPU 正常单步入口验证内存复制、调用返回、超大请求回退、配置失败后继续工作，以及其他特权级或硬件线程执行原始指令。删除直接调用私有页表辅助函数、断言固定映射数量及用内部 `walk` 验证内部 `mappage` 的用例；对应辅助方法恢复为私有。
 
-共 1 条发现：高危 0、中危 1、低危 0。
+原来的超预算测试中，页表分支会先因未配置加速或地址未对齐而返回，不能证明预算有效。新用例先启用有效加速配置，再检查超大请求是否执行了客体指令并保持目标数据不变。稀疏分配、复制和释放通过完整 xv6 usertests 验证。DMA 保留失效及架构异常测试继续保留，结果见 [验证记录](../docs/repository-status/verification.md)。
 
-## 发现的问题
-
-### 1. 快速路径没有单步工作预算，`memmove` 仍可增长到 guest 给定长度
-
-- 位置：[`src/cpu.rs:833`](/home/akira/codespace/arvsim/src/cpu.rs#L833)、[`src/cpu.rs:851`](/home/akira/codespace/arvsim/src/cpu.rs#L851)、[`src/cpu.rs:869`](/home/akira/codespace/arvsim/src/cpu.rs#L869)、[`src/cpu.rs:920`](/home/akira/codespace/arvsim/src/cpu.rs#L920)、[`src/cpu.rs:943`](/home/akira/codespace/arvsim/src/cpu.rs#L943)、[`src/cpu.rs:993`](/home/akira/codespace/arvsim/src/cpu.rs#L993)
-- 分级：中危 · 健壮性
-- 备注：状态文档已概括为“不适合运行不可信输入”，本条补充具体触发方式和统一修复边界
-
-`memcmp/memmove/strncmp/strncpy` 的长度来自 guest 寄存器，页表区间路径也按 guest 给定页数或字节数循环；`strlen` 更没有显式终点。这些循环都在一次 `Machine::step()` 内完成，因此 `RunOptions::max_steps` 无法中断它们。
-
-`fast_xv6_memmove` 虽已从 `Vec::with_capacity(len)` 改为按需 `push`，最终仍会保存全部 `len` 字节。`len` 经 `u32` 截断后最大仍为 4 GiB；监督模式 guest 可以用 Sv39 别名让很大的虚拟范围持续可读，从而让宿主长时间停在一次单步内并耗尽内存。稀疏页表预检查同样可能在畸形但可遍历的巨大范围上耗费无界时间。
-
-**修改建议：**
-
-```rust
-pub struct Xv6Accelerator {
-    // 现有符号和布局字段……
-    pub max_fast_path_bytes: u64,
-    pub max_fast_path_pages: u64,
-}
-
-fn fast_len_allowed(&self, len: u64) -> bool {
-    self.xv6_accelerator
-        .is_some_and(|config| len <= config.max_fast_path_bytes)
-}
-
-// 必须在任何写入、分配或页表修改之前决定是否回退。
-if !self.fast_len_allowed(len as u64) {
-    return Ok(false);
-}
-```
-
-为无长度的 `strlen` 设置扫描上限，达到上限即回退到真实 guest 指令；为页表路径单独限制页数。`memmove` 在预算内也可用固定大小临时块分段处理：根据区间重叠关系选择从前往后或从后往前复制，且每块仍须先读完再写回，避免保存完整向量。配置入口应拒绝零预算、反向 DRAM/进程区间和明显不一致的范围。
-
-回归测试至少应覆盖：超过预算时无写入并返回 `Ok(false)`；上限内重叠复制保持 `memmove` 语义；无 NUL 字符的别名映射不会让一次 `Machine::step` 无限运行。
-
-## 2026-09-05：DMA 与 LR/SC
-
-DRAM 维护物理页写入版本，CPU 经总线记录并核对保留版本。同页 DMA 写入会使 SC 失败，不同物理页的写入不影响保留；默认 MMIO 不支持 LR/SC。回归通过实际 LR、DMA 写入和 SC 检查内存与返回值。
+标准依据：[RISC-V A 扩展](https://riscv.github.io/riscv-unified-db/manual/html/isa/isa_20240411/chapters/a-st-ext.html)、[监督级架构](https://docs.riscv.org/reference/isa/priv/supervisor.html)。可选内核加速会合并指令，不能证明精确时序或完整 ISA 符合性；限制见 [CPU 文档](../docs/repository-status/cpu.md)。

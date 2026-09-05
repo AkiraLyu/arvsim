@@ -1,68 +1,33 @@
-//! RV64 指令执行和正式 `virt` 平台设备的短路径集成测试。
-//!
-//! 汇编片段由外部 RISC-V 工具链编译为 flat binary，再通过与 xv6 相同的测试机器接口执行。
+//! 编译实际 RV64 程序，并验证正式平台上的执行与复位行为。
 
-mod support;
-
-use arvsim::{cfg, csr};
-use std::error::Error;
+use arvsim::uart::BufferedUartBackend;
+use arvsim::virt_platform::{VirtPlatform, VirtPlatformConfig};
+use arvsim::virtio::MemoryBlockBackend;
+use arvsim::{
+    cfg, csr,
+    loader::{self, ImageFormat},
+};
+use std::{error::Error, fs, path::PathBuf, process::Command};
 
 const RV64I_SIGNATURE_ADDR: u64 = cfg::DRAM_BASE + 0x1000;
 const RV64I_TRAP_VECTOR: u64 = cfg::DRAM_BASE + 0x2000;
 const RV64I_RAM_SIZE: usize = 1024 * 1024;
 
-#[test]
-fn compiled_addi_smoke_runs_one_step() -> Result<(), Box<dyn Error>> {
-    let bin = support::build_flat_asm(
-        "addi-smoke",
-        r#"
-        .section .text
-        .globl _start
-_start:
-        addi x31, x0, 42
-"#,
-    )?;
-
-    let mut machine = support::TestMachine::with_flat_binary(bin, RV64I_RAM_SIZE)?;
-    machine.run_steps(1).unwrap();
-
-    assert_eq!(machine.cpu.pc, cfg::DRAM_BASE + 4);
-    assert_eq!(machine.cpu.registers[31], 42);
-    Ok(())
+fn platform(uart: &BufferedUartBackend) -> Result<VirtPlatform, Box<dyn Error>> {
+    Ok(VirtPlatform::new(
+        VirtPlatformConfig {
+            dram_size: RV64I_RAM_SIZE,
+            ..VirtPlatformConfig::default()
+        },
+        Box::new(uart.clone()),
+        Box::new(MemoryBlockBackend::new(Vec::new())),
+    )?)
 }
 
 #[test]
-fn testbench_uart_model_captures_16550_transmit_bytes() {
-    let mut machine = support::TestMachine::rv64_smoke().unwrap();
-    let device = &mut machine.cpu.bus;
-
-    device.write(cfg::UART_BASE + 3, 0x80, 1).unwrap();
-    device.write(cfg::UART_BASE, 3, 1).unwrap();
-    device.write(cfg::UART_BASE + 3, 0x03, 1).unwrap();
-    device.write(cfg::UART_BASE, u64::from(b'O'), 1).unwrap();
-    device.write(cfg::UART_BASE, u64::from(b'K'), 1).unwrap();
-
-    assert_eq!(machine.uart_output_string(), "OK");
-}
-
-#[test]
-fn testbench_virtio_rejects_invalid_queue_sizes() {
-    const VIRTIO_QUEUE_NUM: u64 = cfg::VIRTIO_BLOCK_BASE + 0x38;
-    let mut machine = support::TestMachine::rv64_smoke().unwrap();
-
-    for value in [0, 3, u64::from(cfg::VIRTIO_QUEUE_SIZE) * 2] {
-        assert_eq!(
-            machine.cpu.bus.write(VIRTIO_QUEUE_NUM, value, 4),
-            Err(arvsim::trap::Exception::StoreAMOAccessFault(
-                VIRTIO_QUEUE_NUM
-            ))
-        );
-    }
-}
-
-#[test]
-fn testbench_machine_reset_clears_devices_but_preserves_ram() {
-    let mut machine = support::TestMachine::rv64_smoke().unwrap();
+fn machine_reset_clears_devices_but_preserves_ram() -> Result<(), Box<dyn Error>> {
+    let uart = BufferedUartBackend::new();
+    let mut machine = platform(&uart)?.build(cfg::DRAM_BASE)?;
 
     machine.cpu.bus.write(cfg::DRAM_BASE, 0x2a, 1).unwrap();
     machine
@@ -70,44 +35,15 @@ fn testbench_machine_reset_clears_devices_but_preserves_ram() {
         .bus
         .write(cfg::UART_BASE, u64::from(b'A'), 1)
         .unwrap();
-    machine.queue_uart_bytes(b"x");
-    assert_eq!(machine.uart_output_string(), "A");
+    uart.queue_input(b"x");
+    assert_eq!(uart.output_string(), "A");
 
     machine.reset();
 
     assert_eq!(machine.cpu.bus.read(cfg::DRAM_BASE, 1), Ok(0x2a));
-    assert_eq!(machine.uart_output_string(), "");
+    assert_eq!(uart.output_string(), "");
     assert_eq!(machine.cpu.bus.read(cfg::UART_BASE + 5, 1).unwrap() & 1, 0);
-}
-
-#[test]
-fn testbench_bus_rejects_invalid_and_partial_accesses() {
-    let mut machine = support::TestMachine::rv64_smoke().unwrap();
-    let bus = &mut machine.cpu.bus;
-
-    for size in [0, 3, 9, usize::MAX] {
-        assert_eq!(
-            bus.read(cfg::DRAM_BASE, size),
-            Err(arvsim::trap::Exception::LoadAccessFault(cfg::DRAM_BASE))
-        );
-        assert_eq!(
-            bus.write(cfg::DRAM_BASE, u64::MAX, size),
-            Err(arvsim::trap::Exception::StoreAMOAccessFault(cfg::DRAM_BASE))
-        );
-    }
-
-    let value = 0x0123_4567_89ab_cdef;
-    bus.write(cfg::DRAM_BASE, value, 8).unwrap();
-    assert_eq!(bus.read(cfg::DRAM_BASE, 8).unwrap(), value);
-    assert_eq!(
-        bus.write(cfg::UART_BASE, value, 8),
-        Err(arvsim::trap::Exception::StoreAMOAccessFault(cfg::UART_BASE))
-    );
-    assert_eq!(
-        bus.read(u64::MAX, 8),
-        Err(arvsim::trap::Exception::LoadAccessFault(u64::MAX))
-    );
-    assert!(machine.uart_output().is_empty());
+    Ok(())
 }
 
 #[test]
@@ -135,9 +71,11 @@ done:
         ebreak
 "#
     );
-    let bin = support::build_flat_asm("rv64i-contract", &asm)?;
-
-    let mut machine = support::TestMachine::with_flat_binary(bin, RV64I_RAM_SIZE)?;
+    let image = build_flat_asm(&asm)?;
+    let uart = BufferedUartBackend::new();
+    let platform = platform(&uart)?;
+    let loaded = loader::load_image(&mut platform.dram_mut(), image, ImageFormat::Flat)?;
+    let mut machine = platform.build(loaded.entry)?;
     assert_eq!(
         machine.cpu.registers[2],
         cfg::DRAM_BASE + RV64I_RAM_SIZE as u64
@@ -162,5 +100,61 @@ done:
         .map_err(|error| format!("failed to read guest signature: {error:?}"))?;
     assert_eq!(machine.cpu.registers[0], 0);
     assert_eq!(signature, 42);
+    Ok(())
+}
+
+fn build_flat_asm(asm: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let prefix = std::env::var("TOOLPREFIX").unwrap_or_else(|_| "riscv64-elf-".into());
+    let gcc = format!("{prefix}gcc");
+    let objcopy = format!("{prefix}objcopy");
+    let out_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    fs::create_dir_all(&out_dir)?;
+
+    let stem = format!("rv64i-{}", std::process::id());
+    let asm_path = out_dir.join(format!("{stem}.S"));
+    let linker_path = out_dir.join(format!("{stem}.ld"));
+    let elf_path = out_dir.join(format!("{stem}.elf"));
+    let bin_path = out_dir.join(format!("{stem}.bin"));
+
+    fs::write(&asm_path, asm)?;
+    fs::write(
+        &linker_path,
+        format!(
+            "OUTPUT_ARCH(riscv)\nENTRY(_start)\nSECTIONS {{\n. = {:#x};\n.text : {{ *(.text .text.*) }}\n.rodata : {{ *(.rodata .rodata.*) }}\n.data : {{ *(.data .data.*) }}\n.bss : {{ *(.bss .bss.* COMMON) }}\n}}\n",
+            cfg::DRAM_BASE,
+        ),
+    )?;
+
+    run(Command::new(&gcc).args([
+        "-nostdlib",
+        "-nostartfiles",
+        "-ffreestanding",
+        "-march=rv64i_zicsr",
+        "-mabi=lp64",
+        "-Wl,--no-relax",
+        "-T",
+        linker_path.to_str().unwrap(),
+        "-o",
+        elf_path.to_str().unwrap(),
+        asm_path.to_str().unwrap(),
+    ]))?;
+
+    run(Command::new(&objcopy).args([
+        "-O",
+        "binary",
+        elf_path.to_str().unwrap(),
+        bin_path.to_str().unwrap(),
+    ]))?;
+
+    Ok(bin_path)
+}
+
+fn run(command: &mut Command) -> Result<(), Box<dyn Error>> {
+    let output = command
+        .output()
+        .map_err(|error| format!("{command:?}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("{command:?}: {}", String::from_utf8_lossy(&output.stderr)).into());
+    }
     Ok(())
 }

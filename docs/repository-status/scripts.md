@@ -1,28 +1,27 @@
-# `scripts/`：构建、测试与交互运行
+# 构建、测试与交互运行
 
-## `build_xv6_fixture.sh`
+## 构建 xv6 镜像
 
-检查宿主工具和 RISC-V 工具链（包括 `nm`），通过 `git init/fetch` 克隆或更新 `mit-pdos/xv6-riscv`，构建内核和 `fs.img`，将内核 ELF 转成裸二进制镜像，并生成 `fixture.env`。`XV6_REF` 可使用分支、标签或可获取的提交哈希；复用目录时会同步 `origin` 到当前 `XV6_REPO`。入口地址在固定英文 locale 下解析，无法取得时脚本直接失败。可通过 `XV6_DIR`、`XV6_REPO`、`XV6_REF` 和 `TOOLPREFIX` 覆盖默认值；测试辅助模块和交互脚本使用相同的 `XV6_DIR`、`TOOLPREFIX` 约定。
+`scripts/build_xv6_fixture.sh` 从 `fixtures/xv6-revision` 读取默认提交，完整重建内核、裸二进制、文件系统和 usertests，并生成 `fixture.env` 与 `fixture.sha256`。元数据记录实际提交，镜像路径使用相对路径，目录迁移后仍可验证。
 
-状态：可用，但来源可复现性不完整。CPU 会从生成的内核 ELF 中读取加速地址，链接地址变化不再导致误触发。脚本默认跟随可变分支，没有固定 xv6 提交版本；如果结构布局变化，仍可能不兼容。已有源码目录更新失败时，脚本只打印警告并继续使用旧 `HEAD`，即使调用方显式改变了 `XV6_REPO/XV6_REF`；随后 `fixture.env` 仍记录请求的仓库和 ref，而不是说明复用了旧 checkout。
+可用 `XV6_DIR`、`XV6_REPO`、`XV6_REF`、`TOOLPREFIX` 覆盖配置。获取失败立即退出；`XV6_OFFLINE=1` 只允许复用仓库地址、请求提交与当前 HEAD 均匹配的本地源码。脚本拒绝覆盖已跟踪文件的修改。
 
-## `run_testbench.sh`
+依赖 Bash、Git、Make、宿主 GCC、Perl、SHA-256 工具和 RISC-V GCC/binutils。在线构建另需网络。
 
-支持四种模式：运行默认测试；先生成 xv6 测试文件再运行默认测试；运行可选的 xv6 验收测试；先生成测试文件再只运行 xv6 验收测试。脚本只接受零或一个模式参数，多余参数会显示用法并返回 2。生成测试文件的模式会设置 `ARVSIM_REQUIRE_XV6_FIXTURE=1` 执行完整性检查，缺失文件不能再被当作普通通过。`--future-contracts` 是历史参数名，它会先运行默认测试，再运行标有 `#[ignore]` 的 xv6 测试，但不会生成测试文件，因此缺少文件时会失败。
+## 运行测试
 
-## `run_xv6_cli.sh`
+`scripts/run_testbench.sh` 支持默认测试、`--with-xv6-fixture`、`--future-contracts`、`--xv6-contracts`。默认检查使用 `cargo test --all-targets`，包括示例参数测试；耗时 xv6 验收使用 release 构建，逐项执行基础程序和完整 usertests。生成镜像的模式会设置 `ARVSIM_REQUIRE_XV6_FIXTURE=1`。历史参数 `--future-contracts` 表示执行可选 xv6 验收测试，不会生成镜像。
 
-按 `XV6_DIR` 确保 xv6 测试文件存在，并以 `release` 模式构建库，然后在 `target/testbench/generated` 生成临时 Rust 程序。该程序直接包含 `tests/support/mod.rs`，再以仓库相同的 Rust 2024 edition 链接 Cargo 生成的确定性顶层 `libarvsim.rlib`。固定路径前缀与带引号的 heredoc 分开生成，正文不会被 shell 展开。交互模式把标准输入发送到正式缓冲 UART 后端，并按原始字节转发输出，非 ASCII 数据不会经过字符串切片；按 `Ctrl-]` 退出，使用 `--boot-only` 时在出现 shell 提示符后退出。显式帮助写入标准输出，参数错误的用法写入标准错误。
+## 交互运行
 
-状态：可以快速启动交互式 xv6，但不是正式命令行功能。脚本仍通过内嵌文本生成 Rust 源码并直接依赖测试辅助接口；生成程序的执行循环调用 `Machine::step()`，UART 输入输出及 PLIC/virtio 路径均来自正式 `VirtPlatform`。`ARVSIM_XV6_CLI_STEP_CHUNK` 当前未要求大于零：设为 0 时 CPU 不再推进，步数超时也永远不会触发；非法环境值则静默回退默认值。runner 还会保留全部已打印 UART 历史，长期会话的宿主内存随累计输出增长。
+`scripts/run_xv6_cli.sh [--build-fixture] [--boot-only]` 调用正式 Cargo 示例 `examples/xv6.rs`，不再生成 Rust 程序或包含测试源码。交互模式转发原始 UART 字节，按 `Ctrl-]` 退出，并在退出时恢复终端设置。
 
-## 命令与依赖
+也可以直接运行：
 
-- `scripts/run_testbench.sh [--with-xv6-fixture|--future-contracts|--xv6-contracts]`
-- `scripts/run_xv6_cli.sh [--build-fixture] [--boot-only]`
-- 依赖 Bash、Git、Make、GCC、Perl、RISC-V binutils/GCC、网络和上游 xv6。
-- 交互脚本还依赖 `cargo/rustc/stty`，并依赖测试辅助模块当前的源码布局。
+```sh
+cargo run --release --example xv6 -- --boot-only
+```
 
-## 改进建议
+`ARVSIM_XV6_CLI_STEP_CHUNK` 和 `ARVSIM_XV6_CLI_BOOT_STEPS` 必须是正整数，零值、负数、非法文本和溢出均报错。启动预算不会因大步长而超出；UART 至少每一万步排出一次，已打印历史会清除，提示符可跨输出批次匹配。
 
-固定并校验 xv6 提交版本与测试文件哈希；获取失败时默认终止，只在显式离线模式下校验并记录实际复用版本；严格解析 runner 的正数步长和预算；让交互输出可增量取走而不是保留完整历史；把临时运行程序改成 Cargo 可执行目标或示例程序；让主命令行暴露已有正式 `VirtPlatform` preset；自动查找工具链前缀；重命名 `--future-contracts`，明确区分测试跳过和失败；在持续集成中缓存测试文件，并分开运行快速测试和定时长测。
+默认启用固定 xv6 版本的内核加速。Cargo 示例接受 `--no-acceleration`；通过脚本运行时可设置 `ARVSIM_XV6_NO_ACCELERATION=1`。关闭加速后只需内核 ELF 与磁盘镜像，通常需要提高启动和测试预算。当前主命令行 `arvsim` 仍只提供 DRAM/UART 配置；完整平台通过库或此示例运行。

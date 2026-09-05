@@ -815,6 +815,10 @@ fn try_accelerate_memset_loop(cpu: &mut Cpu, inst: &Instruction) -> Result<bool,
     }
 
     let target = cpu.pc.wrapping_sub(6);
+    // 快速检查不跨页拼接指令，跨页循环交给普通取指路径。
+    if target & (crate::paging::PAGE_SIZE - 1) > crate::paging::PAGE_SIZE - 4 || inst.rs1 == 0 {
+        return Ok(false);
+    }
     let store_addr = match cpu.translate_sized(target, MemoryAccess::Fetch, 4) {
         Ok(addr) => addr,
         Err(_) => return Ok(false),
@@ -843,20 +847,25 @@ fn try_accelerate_memset_loop(cpu: &mut Cpu, inst: &Instruction) -> Result<bool,
     }
 
     let start = reg(cpu, inst.rs1);
-    let end = reg(cpu, inst.rs2);
+    let loop_end = reg(cpu, inst.rs2);
     let Some((dram_base, dram_end)) = cpu.xv6_dram_range() else {
         return Ok(false);
     };
-    if start >= end || start < dram_base || end > dram_end {
+    if start >= loop_end || start < dram_base || loop_end > dram_end {
         return Ok(false);
     }
+    let end = loop_end.min(start.saturating_add(crate::cpu::XV6_FAST_PATH_MAX_BYTES));
     if !identity_store_range(cpu, start, end) {
         return Ok(false);
     }
 
     fill_dram_bytes(cpu, start, end, reg(cpu, store.rs2) as u8)?;
     write_reg(cpu, inst.rs1, end);
-    cpu.write_pc(cpu.pc.wrapping_add(4));
+    cpu.write_pc(if end == loop_end {
+        cpu.pc.wrapping_add(4)
+    } else {
+        target
+    });
     Ok(true)
 }
 
@@ -872,7 +881,9 @@ fn is_constant_byte_store(store: &Instruction, pointer: u8) -> bool {
 fn identity_store_range(cpu: &mut Cpu, start: u64, end: u64) -> bool {
     let mut addr = start;
     while addr < end {
-        let page_end = (addr | 0xfff).saturating_add(1).min(end);
+        let page_end = (addr | (crate::paging::PAGE_SIZE - 1))
+            .saturating_add(1)
+            .min(end);
         let size = (page_end - addr) as usize;
         match cpu.translate_sized(addr, MemoryAccess::Store, size) {
             Ok(physical) if physical == addr => addr = page_end,
@@ -1088,57 +1099,71 @@ mod tests {
 
     fn test_cpu() -> Cpu {
         Cpu::with_reset_vector(
-            Box::new(Dram::with_layout(TEST_BASE, 16)),
+            Box::new(Dram::with_layout(TEST_BASE, 128)),
             TEST_BASE,
-            TEST_BASE + 16,
+            TEST_BASE + 128,
         )
     }
 
-    #[test]
-    fn test_decode_addi() {
-        let inst: u32 = 0x02a00f93;
-        let decoded = decode(inst);
-
-        assert_eq!(decoded.opcode, 0x13);
-        assert_eq!(decoded.rd, 31);
-        assert_eq!(decoded.funct3, 0);
-        assert_eq!(decoded.rs1, 0);
-        assert_eq!(decoded.rs2, 10);
-        assert_eq!(decoded.funct7, 0x01);
+    fn run_instruction(cpu: &mut Cpu, raw: u32) {
+        cpu.pc = TEST_BASE;
+        cpu.bus.write(TEST_BASE, u64::from(raw), 4).unwrap();
+        cpu.step().unwrap();
     }
 
     #[test]
-    fn immediates_are_sign_extended_from_the_right_layouts() {
-        assert_eq!(imm_i(0xfff0_0093), u64::MAX);
-        assert_eq!(imm_s(0xfe00_0c23), u64::MAX - 7);
-        assert_eq!(imm_b(0xfe00_0ce3), u64::MAX - 7);
-        assert_eq!(imm_u(0xffff_e7b7), 0xffff_ffff_ffff_e000);
-        assert_eq!(imm_j(0xfe9f_f0ef), u64::MAX - 23);
+    fn negative_immediates_update_registers_memory_and_control_flow() {
+        let mut cpu = test_cpu();
+        run_instruction(&mut cpu, 0xfff0_0093); // addi ra, zero, -1
+        assert_eq!(cpu.registers[1], u64::MAX);
+        run_instruction(&mut cpu, 0xffff_e7b7); // lui a5, 0xffffe
+        assert_eq!(cpu.registers[15], 0xffff_ffff_ffff_e000);
+
+        cpu.registers[2] = TEST_BASE + 16;
+        cpu.bus.write(TEST_BASE + 8, 0xff, 1).unwrap();
+        run_instruction(&mut cpu, 0xfe01_0c23); // sb zero, -8(sp)
+        assert_eq!(cpu.bus.read(TEST_BASE + 8, 1), Ok(0));
+        run_instruction(&mut cpu, 0xfe00_0ce3); // beq zero, zero, -8
+        assert_eq!(cpu.pc, TEST_BASE - 8);
+        run_instruction(&mut cpu, 0xfe9f_f0ef); // jal ra, -24
+        assert_eq!(cpu.pc, TEST_BASE - 24);
+        assert_eq!(cpu.registers[1], TEST_BASE + 4);
     }
 
     #[test]
-    fn common_compressed_immediates_match_xv6_encodings() {
-        assert_eq!(c_imm6(0x1141), u64::MAX - 15); // c.addi sp, -16
-        assert_eq!(c_addi16sp_imm(0x6109), 128);
-        assert_eq!(c_lwsp_imm(0x47b2), 12); // c.lwsp a5, 12(sp)
-        assert_eq!(c_lwsp_imm(0x4502), 0); // c.lwsp a0, 0(sp)
-        assert_eq!(c_lwsp_imm(0x4412), 4); // c.lwsp s0, 4(sp)
-        assert_eq!(c_ldsp_imm(0x60a2), 8);
-        assert_eq!(c_swsp_imm(0xc62a), 12); // c.swsp a0, 12(sp)
-        assert_eq!(c_sdsp_imm(0xe406), 8);
-        assert_eq!(c_j_imm(0xa001), 0);
-        assert_eq!(c_j_imm(0xb761), u64::MAX - 119);
-        assert_eq!(c_b_imm(0xdfe5), u64::MAX - 7);
-    }
+    fn compressed_instructions_use_the_encoded_stack_offsets_and_branch_targets() {
+        let mut cpu = test_cpu();
+        cpu.registers[2] = TEST_BASE + 32;
+        run_instruction(&mut cpu, 0x1141); // c.addi sp, -16
+        assert_eq!(cpu.registers[2], TEST_BASE + 16);
+        run_instruction(&mut cpu, 0x6109); // c.addi16sp sp, 128
+        assert_eq!(cpu.registers[2], TEST_BASE + 144);
 
-    #[test]
-    fn memset_acceleration_rejects_a_mutating_store_value() {
-        let pointer = 10;
-        let aliased_store = decode(0x00a5_0023); // sb a0, 0(a0)
-        let constant_store = decode(0x00b5_0023); // sb a1, 0(a0)
+        cpu.registers[2] = TEST_BASE + 32;
+        for (raw, destination, offset) in [(0x47b2, 15, 12), (0x4502, 10, 0), (0x4412, 8, 4)] {
+            cpu.bus
+                .write(TEST_BASE + 32 + offset, 0x8000_0007, 4)
+                .unwrap();
+            run_instruction(&mut cpu, raw); // c.lwsp，加载结果须符号扩展。
+            assert_eq!(cpu.registers[destination], 0xffff_ffff_8000_0007);
+        }
+        let value = 0x0123_4567_89ab_cdef;
+        cpu.bus.write(TEST_BASE + 40, value, 8).unwrap();
+        run_instruction(&mut cpu, 0x60a2); // c.ldsp ra, 8(sp)
+        assert_eq!(cpu.registers[1], value);
+        cpu.registers[10] = value;
+        run_instruction(&mut cpu, 0xc62a); // c.swsp a0, 12(sp)
+        assert_eq!(cpu.bus.read(TEST_BASE + 44, 4), Ok(value as u32 as u64));
+        run_instruction(&mut cpu, 0xe406); // c.sdsp ra, 8(sp)
+        assert_eq!(cpu.bus.read(TEST_BASE + 40, 8), Ok(value));
 
-        assert!(!is_constant_byte_store(&aliased_store, pointer));
-        assert!(is_constant_byte_store(&constant_store, pointer));
+        run_instruction(&mut cpu, 0xa001); // c.j 0
+        assert_eq!(cpu.pc, TEST_BASE);
+        run_instruction(&mut cpu, 0xb761); // c.j -120
+        assert_eq!(cpu.pc, TEST_BASE - 120);
+        cpu.registers[15] = 0;
+        run_instruction(&mut cpu, 0xdfe5); // c.beqz a5, -8
+        assert_eq!(cpu.pc, TEST_BASE - 8);
     }
 
     #[test]

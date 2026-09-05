@@ -1,6 +1,6 @@
 # `src/main.rs`：命令行入口审查记录
 
-> 本文属于代码审查报告（基线：提交 `17ad107` 的当前工作区，2026-08-12），只记录本轮审查结论；未改动实现代码。总览见 [README](./README.md)。对应的现状文档：[main.md](/home/akira/codespace/arvsim/docs/repository-status/main.md)。
+> 本文保留 2026-08-12 的历史审查结论。本轮未修改该模块；当前修复和验证状态以总览为准。总览见 [README](./README.md)。对应的现状文档：[main.md](../docs/repository-status/main.md)。
 
 ## 审查范围与总体判断
 
